@@ -13,12 +13,14 @@ Endpoints:
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_league_admin, require_league_member
-from app.models import League, LeagueMember, LeagueMemberRole, Season, User
+from app.models import League, LeagueMember, LeagueMemberRole, LeagueTournament, Season, Tournament, User
 from app.schemas.league import LeagueCreate, LeagueMemberOut, LeagueOut, RoleUpdate
+from app.schemas.tournament import TournamentOut
 
 router = APIRouter(prefix="/leagues", tags=["leagues"])
 
@@ -173,3 +175,72 @@ def remove_member(
 
     db.delete(membership)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Tournament schedule
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{slug}/tournaments", response_model=list[TournamentOut])
+def get_league_tournaments(
+    league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the tournaments selected for this league's schedule, sorted by
+    start_date ascending. Returns [] if the admin hasn't configured the
+    schedule yet.
+    """
+    league, _ = league_and_member
+    rows = (
+        db.query(LeagueTournament)
+        .filter_by(league_id=league.id)
+        .join(LeagueTournament.tournament)
+        .order_by(Tournament.start_date.asc())
+        .all()
+    )
+    return [row.tournament for row in rows]
+
+
+class TournamentScheduleUpdate(BaseModel):
+    tournament_ids: list[uuid.UUID]
+
+
+@router.put("/{slug}/tournaments", response_model=list[TournamentOut])
+def update_league_tournaments(
+    body: TournamentScheduleUpdate,
+    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Atomically replace the league's tournament schedule.
+
+    Sends the full desired selection — existing rows not in the new list are
+    deleted, new IDs are inserted. Returns the updated sorted schedule.
+    Requires league admin.
+    """
+    league, _ = league_and_admin
+
+    # Verify all requested tournament IDs actually exist.
+    if body.tournament_ids:
+        found = db.query(Tournament).filter(
+            Tournament.id.in_(body.tournament_ids)
+        ).count()
+        if found != len(body.tournament_ids):
+            raise HTTPException(status_code=422, detail="One or more tournament IDs not found")
+
+    # Atomic replace: delete all existing selections, insert new ones.
+    db.query(LeagueTournament).filter_by(league_id=league.id).delete()
+    for t_id in body.tournament_ids:
+        db.add(LeagueTournament(league_id=league.id, tournament_id=t_id))
+    db.commit()
+
+    rows = (
+        db.query(LeagueTournament)
+        .filter_by(league_id=league.id)
+        .join(LeagueTournament.tournament)
+        .order_by(Tournament.start_date.asc())
+        .all()
+    )
+    return [row.tournament for row in rows]

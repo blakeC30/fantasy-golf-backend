@@ -11,13 +11,12 @@ Architecture
 The functions here are split into two clear layers:
 
   1. Parsing (pure functions):
-     parse_schedule_response() and parse_summary_response() take raw API
-     JSON and return clean dicts. No DB access, so they're trivial to unit
-     test with fixture data.
+     parse_schedule_response() takes the scoreboard JSON and returns clean
+     tournament dicts. No DB access, so it's trivial to unit test.
 
   2. Database (upsert functions):
-     upsert_tournaments(), upsert_field(), upsert_results(), score_picks()
-     take the parsed dicts and write to the DB using SQLAlchemy sessions.
+     upsert_tournaments(), upsert_field(), score_picks() take parsed dicts
+     and write to the DB using SQLAlchemy sessions.
 
 High-level orchestration functions (sync_schedule, sync_tournament,
 full_sync) combine both layers and are what the scheduler and admin
@@ -25,20 +24,30 @@ endpoint call.
 
 ESPN API endpoints used
 -----------------------
-  Schedule: https://site.api.espn.com/apis/site/v2/sports/golf/pga/scoreboard
-            ?dates={YYYY}  → returns all events for that calendar year
+  Schedule:  https://site.api.espn.com/apis/site/v2/sports/golf/pga/scoreboard
+             ?dates={YYYY}  → all events for that calendar year
 
-  Summary:  https://site.api.espn.com/apis/site/v2/sports/golf/pga/summary
-            ?event={espnEventId}  → leaderboard + field for one tournament
+  Core API:  https://sports.core.api.espn.com/v2/sports/golf/leagues/pga/...
+             /events/{id}/competitions/{id}/competitors?limit=200
+               → all golfers in the field with finish order
+             /events/{id}/competitions/{id}/competitors/{athlete_id}/statistics
+               → earnings for completed tournaments
+             /athletes/{athlete_id}
+               → golfer name and country
+
+Note: The older summary endpoint (site.api.espn.com/...pga/summary?event=)
+is no longer functional — it returns ESPN error code 2500 for all event IDs.
+The core API endpoints above are the reliable replacement.
 """
 
+import concurrent.futures
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models import Golfer, Pick, Season, Tournament, TournamentEntry, TournamentStatus
+from app.models import Golfer, Pick, Tournament, TournamentEntry, TournamentStatus
 
 log = logging.getLogger(__name__)
 
@@ -46,12 +55,12 @@ log = logging.getLogger(__name__)
 # ESPN API constants
 # ---------------------------------------------------------------------------
 _SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/golf/pga/scoreboard"
-_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/golf/pga/summary"
+_CORE_API_BASE = "https://sports.core.api.espn.com/v2/sports/golf/leagues/pga"
 _REQUEST_TIMEOUT = 30.0  # seconds
 
 
 # ---------------------------------------------------------------------------
-# HTTP helper
+# HTTP helpers
 # ---------------------------------------------------------------------------
 
 def _get_json(url: str, params: dict | None = None) -> dict:
@@ -67,6 +76,149 @@ def _get_json(url: str, params: dict | None = None) -> dict:
         return resp.json()
 
 
+_FETCH_WORKERS = 5  # concurrent threads for athlete lookups
+
+
+def _fetch_athlete_info(athlete_id: str) -> dict:
+    """
+    Fetch one golfer's display name and country from the ESPN core API.
+    Returns a dict with pga_tour_id, name, country. Safe to call concurrently.
+    """
+    url = f"{_CORE_API_BASE}/athletes/{athlete_id}"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(url)
+            if resp.status_code == 200:
+                d = resp.json()
+                return {
+                    "pga_tour_id": str(athlete_id),
+                    "name": d.get("displayName", "Unknown"),
+                    "country": d.get("citizenship") or None,
+                }
+    except httpx.RequestError as exc:
+        log.warning("Could not fetch athlete %s: %s", athlete_id, exc)
+    return {"pga_tour_id": str(athlete_id), "name": "Unknown", "country": None}
+
+
+def _fetch_tournament_data(
+    pga_tour_id: str,
+    known_golfer_ids: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Fetch the golfer field and finish order for one tournament.
+
+    Uses the ESPN core API competitors endpoint (event-specific, unlike the
+    web scoreboard which ignores the event parameter). One request gets all
+    competitor IDs and finish positions; athlete names are fetched concurrently
+    for golfers not already cached in known_golfer_ids.
+
+    Earnings are left as None — fetched on-demand in score_picks() for only
+    the golfers users actually picked (1 API call per pick, not per field).
+
+    Args:
+      pga_tour_id:       ESPN event ID for the tournament.
+      known_golfer_ids:  pga_tour_ids already in the DB; skips re-fetching them.
+
+    Returns:
+      golfers  — list of dicts ready to upsert as Golfer rows
+      results  — list of dicts ready to upsert as TournamentEntry rows
+    """
+    # Step 1: one request for the full competitor list (IDs + finish order).
+    competitors_url = (
+        f"{_CORE_API_BASE}/events/{pga_tour_id}"
+        f"/competitions/{pga_tour_id}/competitors"
+    )
+    data = _get_json(competitors_url, params={"limit": 200})
+    competitors = data.get("items", [])
+
+    if not competitors:
+        log.warning("No competitors found for tournament %s", pga_tour_id)
+        return [], []
+
+    known = known_golfer_ids or set()
+    ids_to_fetch = [
+        str(c["id"]) for c in competitors
+        if c.get("id") and str(c["id"]) not in known
+    ]
+
+    # Step 2: fetch athlete info only for golfers not already in DB.
+    athlete_info: dict[str, dict] = {}
+    if ids_to_fetch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures = {pool.submit(_fetch_athlete_info, aid): aid for aid in ids_to_fetch}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    info = future.result()
+                    athlete_info[info["pga_tour_id"]] = info
+                except Exception as exc:
+                    log.warning("Athlete fetch failed: %s", exc)
+
+    log.info(
+        "Tournament %s: %d competitors, %d new athlete fetches",
+        pga_tour_id, len(competitors), len(ids_to_fetch),
+    )
+
+    golfers: list[dict] = []
+    results: list[dict] = []
+    for c in competitors:
+        athlete_id = str(c.get("id", ""))
+        if not athlete_id:
+            continue
+
+        # Use freshly fetched info, or pass name=None for known golfers
+        # (upsert_field will skip updating them).
+        info = athlete_info.get(athlete_id)
+        golfers.append({
+            "pga_tour_id": athlete_id,
+            "name": info["name"] if info else None,
+            "country": info["country"] if info else None,
+        })
+        results.append({
+            "pga_tour_id": athlete_id,
+            "finish_position": c.get("order"),
+            "earnings_usd": None,
+            "status": None,
+            "tee_time": None,
+        })
+
+    return golfers, results
+
+
+def _fetch_golfer_earnings(pga_tour_id: str, athlete_id: str) -> int | None:
+    """
+    Fetch prize earnings for one golfer in one tournament from the ESPN core API.
+
+    Called by score_picks() only for golfers that have actual picks — keeps
+    total API requests low (one per league member who submitted a pick).
+    Returns earnings in USD as an integer, or None if not found.
+    """
+    stats_url = (
+        f"{_CORE_API_BASE}/events/{pga_tour_id}"
+        f"/competitions/{pga_tour_id}/competitors/{athlete_id}/statistics"
+    )
+    try:
+        with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+            resp = client.get(stats_url)
+            if resp.status_code != 200:
+                return None
+            stats_data = resp.json()
+    except httpx.RequestError as exc:
+        log.warning("Could not fetch earnings for athlete %s: %s", athlete_id, exc)
+        return None
+
+    for cat in stats_data.get("splits", {}).get("categories", []):
+        for stat in cat.get("stats", []):
+            if stat.get("name") == "amount":
+                raw = stat.get("value")
+                if raw is not None:
+                    try:
+                        val = int(float(raw))
+                        return val if val > 0 else None
+                    except (ValueError, TypeError):
+                        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Parsing helpers  (pure — no DB access, easy to unit test)
 # ---------------------------------------------------------------------------
@@ -77,6 +229,9 @@ def _map_espn_status(espn_status_name: str) -> str:
         "STATUS_SCHEDULED": TournamentStatus.SCHEDULED.value,
         "STATUS_IN_PROGRESS": TournamentStatus.IN_PROGRESS.value,
         "STATUS_FINAL": TournamentStatus.COMPLETED.value,
+        # Treat cancelled events as completed so they don't surface as "upcoming"
+        # in the pick form and don't get included in the next-scheduled sync.
+        "STATUS_CANCELED": TournamentStatus.COMPLETED.value,
     }.get(espn_status_name, TournamentStatus.SCHEDULED.value)
 
 
@@ -138,78 +293,6 @@ def parse_schedule_response(data: dict) -> list[dict]:
     return results
 
 
-def parse_summary_response(data: dict) -> tuple[list[dict], list[dict]]:
-    """
-    Extract golfer profiles and tournament results from an ESPN summary response.
-
-    Returns:
-      golfers  — list of dicts for upserting Golfer rows
-      results  — list of dicts for upserting TournamentEntry rows
-    """
-    golfers: list[dict] = []
-    results: list[dict] = []
-
-    for entry in data.get("leaderboard", []):
-        athlete = entry.get("athlete") or {}
-        athlete_id = athlete.get("id")
-        if not athlete_id:
-            continue
-
-        # Country from the flag object (alt text or countryCode)
-        flag = athlete.get("flag") or {}
-        country = flag.get("alt") or flag.get("countryCode") or None
-
-        golfers.append({
-            "pga_tour_id": str(athlete_id),
-            "name": athlete.get("displayName", "Unknown"),
-            "country": country,
-        })
-
-        # Earnings are in statistics array
-        earnings: int | None = None
-        for stat in entry.get("statistics") or []:
-            if stat.get("name") in ("earnings", "prize"):
-                raw = stat.get("value")
-                if raw is not None:
-                    try:
-                        earnings = int(float(raw))
-                    except (ValueError, TypeError):
-                        pass
-                break
-
-        # Finish position from sortOrder (1 = winner)
-        position: int | None = None
-        raw_pos = entry.get("sortOrder")
-        if raw_pos is not None:
-            try:
-                position = int(raw_pos)
-            except (ValueError, TypeError):
-                pass
-
-        # Status: active (made cut) vs cut / WD / DQ
-        entry_status: str | None = None
-        raw_status = entry.get("status")
-        if isinstance(raw_status, str) and raw_status.lower() in ("cut", "wd", "mdf", "dq"):
-            entry_status = raw_status.lower()
-
-        # Tee time for pick-lock enforcement
-        tee_time: datetime | None = None
-        raw_tee = entry.get("teeTime")
-        if raw_tee:
-            try:
-                tee_time = datetime.fromisoformat(raw_tee.replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                pass
-
-        results.append({
-            "pga_tour_id": str(athlete_id),  # FK link to golfer
-            "finish_position": position,
-            "earnings_usd": earnings,
-            "status": entry_status,
-            "tee_time": tee_time,
-        })
-
-    return golfers, results
 
 
 # ---------------------------------------------------------------------------
@@ -259,13 +342,20 @@ def upsert_field(
 
     for g in golfers:
         # Upsert golfer profile.
+        # name=None means the golfer was already in DB (known_golfer_ids cache hit);
+        # skip updating to avoid overwriting good data with None.
         golfer = db.query(Golfer).filter_by(pga_tour_id=g["pga_tour_id"]).first()
         if golfer:
-            golfer.name = g["name"]
-            if g.get("country"):
+            if g["name"] is not None:
+                golfer.name = g["name"]
+            if g.get("country") is not None:
                 golfer.country = g["country"]
         else:
-            golfer = Golfer(pga_tour_id=g["pga_tour_id"], name=g["name"], country=g.get("country"))
+            golfer = Golfer(
+                pga_tour_id=g["pga_tour_id"],
+                name=g["name"] or "Unknown",
+                country=g.get("country"),
+            )
             db.add(golfer)
         db.flush()  # ensure golfer.id is populated
 
@@ -307,8 +397,11 @@ def score_picks(db: Session, tournament: Tournament) -> int:
     """
     Calculate and store points_earned for all picks in a completed tournament.
 
-    Called after results are synced. Finds every Pick across all leagues
-    for this tournament, looks up the golfer's earnings, and computes:
+    For each pick we need the golfer's prize earnings. We first check the
+    TournamentEntry row (may already have earnings from a previous sync), and
+    fall back to fetching from the ESPN core API. This keeps requests minimal:
+    one API call per pick, and only for picks that haven't been scored yet.
+
       points_earned = earnings_usd * tournament.multiplier
 
     If the golfer missed the cut (no earnings), points_earned = 0.
@@ -326,12 +419,23 @@ def score_picks(db: Session, tournament: Tournament) -> int:
             tournament_id=tournament.id, golfer_id=pick.golfer_id
         ).first()
 
-        if entry and entry.earnings_usd:
-            pick.points_earned = float(entry.earnings_usd) * tournament.multiplier
-        else:
-            # Missed cut or WD — earns 0 (not the penalty; penalty is for no pick at all)
-            pick.points_earned = 0.0
+        earnings: float | None = None
 
+        if entry and entry.earnings_usd:
+            # Already stored from a previous sync — use it directly.
+            earnings = float(entry.earnings_usd)
+        else:
+            # Not stored yet — fetch from ESPN core API for this specific golfer.
+            golfer = db.query(Golfer).filter_by(id=pick.golfer_id).first()
+            if golfer:
+                raw = _fetch_golfer_earnings(tournament.pga_tour_id, golfer.pga_tour_id)
+                if raw is not None:
+                    earnings = float(raw)
+                    # Persist so future calls skip the API hit.
+                    if entry:
+                        entry.earnings_usd = raw
+
+        pick.points_earned = (earnings or 0.0) * tournament.multiplier
         count += 1
 
     db.commit()
@@ -364,11 +468,11 @@ def sync_schedule(db: Session, year: int) -> dict:
 
 def sync_tournament(db: Session, pga_tour_id: str) -> dict:
     """
-    Sync the field and results for a single tournament.
+    Sync the field and results for a single tournament using the ESPN core API.
 
-    Fetches the ESPN summary for the event, upserts golfers and entries,
-    then scores picks if the tournament is completed.
-    Returns a summary dict with counts.
+    Fetches all competitors concurrently (golfer names + earnings), upserts
+    golfers and tournament entries, then scores picks if the tournament is
+    completed. Returns a summary dict with counts.
     """
     tournament = db.query(Tournament).filter_by(pga_tour_id=pga_tour_id).first()
     if not tournament:
@@ -376,13 +480,16 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
                          "Run sync_schedule first.")
 
     log.info("Syncing tournament '%s' (id=%s)", tournament.name, pga_tour_id)
+
+    # Pass IDs of golfers already in DB so _fetch_tournament_data skips re-fetching them.
+    known_ids = {g.pga_tour_id for g in db.query(Golfer).all()}
+
     try:
-        data = _get_json(_SUMMARY_URL, params={"event": pga_tour_id})
-    except httpx.HTTPError as exc:
-        log.error("Failed to fetch summary for %s: %s", pga_tour_id, exc)
+        golfers, results = _fetch_tournament_data(pga_tour_id, known_golfer_ids=known_ids)
+    except (httpx.HTTPError, httpx.RequestError) as exc:
+        log.error("Failed to fetch field for %s: %s", pga_tour_id, exc)
         raise
 
-    golfers, results = parse_summary_response(data)
     golfers_synced, entries_synced = upsert_field(db, tournament, golfers, results)
 
     # Re-query to get the latest status after upsert.
@@ -408,31 +515,51 @@ def full_sync(db: Session, year: int) -> dict:
     """
     Run a complete sync for an entire year:
       1. Fetch the schedule and upsert all tournaments.
-      2. For each tournament that is IN_PROGRESS or COMPLETED, sync its field.
+      2. For each IN_PROGRESS or COMPLETED tournament, sync its field + results.
+      3. Also sync the single next SCHEDULED tournament so the pick form has
+         a golfer list to show.
 
     This is what the scheduler calls daily and what /admin/sync triggers.
     """
     schedule_result = sync_schedule(db, year)
 
-    # Only sync field/results for active or finished tournaments.
-    # SCHEDULED tournaments don't have a field yet.
+    # Sync field + results for active or finished tournaments.
     active_statuses = {TournamentStatus.IN_PROGRESS.value, TournamentStatus.COMPLETED.value}
-    tournaments = (
+    tournaments_to_sync = (
         db.query(Tournament)
         .filter(Tournament.status.in_(active_statuses))
         .all()
     )
 
+    # Also sync the soonest upcoming scheduled tournament so the pick form works.
+    next_scheduled = (
+        db.query(Tournament)
+        .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+        .order_by(Tournament.start_date.asc())
+        .first()
+    )
+    if next_scheduled and next_scheduled not in tournaments_to_sync:
+        tournaments_to_sync = list(tournaments_to_sync) + [next_scheduled]
+
+    tournaments = tournaments_to_sync
+
     tournament_results = []
     errors = []
 
     for t in tournaments:
+        # Capture identity info before any DB operation so logging still works
+        # even if the session rolls back and expires these attributes.
+        t_id = t.pga_tour_id
+        t_name = t.name
         try:
-            result = sync_tournament(db, t.pga_tour_id)
+            result = sync_tournament(db, t_id)
             tournament_results.append(result)
         except Exception as exc:
-            log.error("Failed to sync tournament '%s': %s", t.name, exc)
-            errors.append({"pga_tour_id": t.pga_tour_id, "name": t.name, "error": str(exc)})
+            # A failed flush invalidates the current transaction. Roll it back
+            # so subsequent iterations start with a clean session state.
+            db.rollback()
+            log.error("Failed to sync tournament '%s': %s", t_name, exc)
+            errors.append({"pga_tour_id": t_id, "name": t_name, "error": str(exc)})
 
     return {
         "year": year,

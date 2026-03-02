@@ -22,6 +22,7 @@ from app.models.base import Base
 if TYPE_CHECKING:
     # Only imported during type-checking (mypy/pyright), not at runtime.
     # This avoids circular imports while keeping the type checker happy.
+    from app.models.league_tournament import LeagueTournament
     from app.models.pick import Pick
     from app.models.season import Season
     from app.models.user import User
@@ -76,6 +77,7 @@ class League(Base):
     members: Mapped[list["LeagueMember"]] = relationship(back_populates="league")
     seasons: Mapped[list["Season"]] = relationship(back_populates="league")
     picks: Mapped[list["Pick"]] = relationship(back_populates="league")
+    league_tournaments: Mapped[list["LeagueTournament"]] = relationship(back_populates="league")
 
     def __repr__(self) -> str:
         return f"<League id={self.id} slug={self.slug!r}>"

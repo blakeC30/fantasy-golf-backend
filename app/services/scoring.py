@@ -12,9 +12,11 @@ This module contains pure calculation logic with no HTTP concerns. It can be
 called from both the standings router and the scraper (when finalizing results).
 """
 
+import datetime
+
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import League, LeagueMember, Pick, Season, Tournament, TournamentStatus
+from app.models import League, LeagueMember, LeagueTournament, Pick, Season, Tournament, TournamentStatus
 
 
 def calculate_standings(db: Session, league: League, season: Season) -> list[dict]:
@@ -24,15 +26,24 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
     Each row is a dict with:
       user_id, display_name, total_points, pick_count, missed_count
     """
-    # Find all tournaments that completed during this season's calendar year.
-    # Tournaments are global (not tied to specific leagues), so we filter by
-    # start_date year and status == COMPLETED.
-    all_completed = (
+    # Only count tournaments the league admin explicitly added to the schedule
+    # AND that have completed. This lets leagues start mid-season and handles
+    # weeks with multiple simultaneous events.
+    scheduled_ids_subq = (
+        db.query(LeagueTournament.tournament_id)
+        .filter(LeagueTournament.league_id == league.id)
+        .subquery()
+    )
+    season_tournaments = (
         db.query(Tournament)
-        .filter(Tournament.status == TournamentStatus.COMPLETED.value)
+        .filter(
+            Tournament.id.in_(scheduled_ids_subq),
+            Tournament.status == TournamentStatus.COMPLETED.value,
+            Tournament.start_date >= datetime.date(season.year, 1, 1),
+            Tournament.start_date <= datetime.date(season.year, 12, 31),
+        )
         .all()
     )
-    season_tournaments = [t for t in all_completed if t.start_date.year == season.year]
     completed_ids = {t.id for t in season_tournaments}
 
     # All members of this league, with their user record loaded in one query.

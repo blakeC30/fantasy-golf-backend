@@ -45,6 +45,7 @@ from app.models.base import Base
 
 if TYPE_CHECKING:
     from app.models.golfer import Golfer
+    from app.models.league_tournament import LeagueTournament
     from app.models.pick import Pick
 
 
@@ -114,6 +115,7 @@ class Tournament(Base):
         back_populates="tournament"
     )
     picks: Mapped[list["Pick"]] = relationship(back_populates="tournament")
+    league_tournaments: Mapped[list["LeagueTournament"]] = relationship(back_populates="tournament")
 
     def __repr__(self) -> str:
         return f"<Tournament name={self.name!r} status={self.status}>"

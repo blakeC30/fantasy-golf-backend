@@ -44,8 +44,8 @@ class Golfer(Base):
     # Nullable — we may not always have ranking data at the time of insert.
     world_ranking: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    # Two-letter country code (e.g. "US", "ZA", "SE"). Nullable for safety.
-    country: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Full country name as returned by ESPN (e.g. "United States", "Ireland").
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

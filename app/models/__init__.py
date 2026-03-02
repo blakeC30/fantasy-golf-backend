@@ -11,6 +11,7 @@ from app.models.season import Season
 from app.models.golfer import Golfer
 from app.models.tournament import Tournament, TournamentEntry, TournamentStatus
 from app.models.pick import Pick
+from app.models.league_tournament import LeagueTournament
 
 __all__ = [
     "Base",
@@ -24,4 +25,5 @@ __all__ = [
     "TournamentEntry",
     "TournamentStatus",
     "Pick",
+    "LeagueTournament",
 ]

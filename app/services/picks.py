@@ -22,7 +22,7 @@ from datetime import date, datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.models import Golfer, Pick, Season, Tournament, TournamentEntry, TournamentStatus
+from app.models import Golfer, LeagueTournament, Pick, Season, Tournament, TournamentEntry, TournamentStatus
 
 
 def validate_new_pick(
@@ -40,6 +40,16 @@ def validate_new_pick(
     tournament = db.query(Tournament).filter_by(id=tournament_id).first()
     if not tournament:
         raise HTTPException(status_code=404, detail="Tournament not found")
+
+    # League schedule check: the admin must have explicitly added this tournament.
+    in_schedule = db.query(LeagueTournament).filter_by(
+        league_id=league_id, tournament_id=tournament_id
+    ).first()
+    if not in_schedule:
+        raise HTTPException(
+            status_code=422,
+            detail="This tournament is not in your league's schedule",
+        )
 
     if tournament.status != TournamentStatus.SCHEDULED.value:
         raise HTTPException(
