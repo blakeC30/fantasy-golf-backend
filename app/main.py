@@ -2,14 +2,14 @@
 FastAPI application entry point.
 
 This file:
-  1. Creates the FastAPI app instance
-  2. Configures CORS (Cross-Origin Resource Sharing)
-  3. Registers all routers under /api/v1
-
-CORS is required because the frontend (localhost:5173 or a different domain)
-makes requests to the backend (localhost:8000). Without CORS headers, browsers
-block these cross-origin requests as a security measure.
+  1. Defines the lifespan context manager (startup/shutdown hooks)
+  2. Creates the FastAPI app instance
+  3. Configures CORS (Cross-Origin Resource Sharing)
+  4. Registers all routers under /api/v1
 """
+
+import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,11 +17,33 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.routers import admin, auth, golfers, leagues, picks, standings, tournaments, users
 
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """
+    FastAPI lifespan: code before `yield` runs at startup, after `yield` at shutdown.
+
+    This replaces the deprecated @app.on_event() decorators. Keeping startup
+    and shutdown in one context manager makes the lifecycle explicit and
+    ensures shutdown always runs even if startup raises an exception.
+    """
+    log.info("Starting Fantasy Golf API")
+    from app.services.scheduler import start_scheduler
+    start_scheduler()
+
+    yield
+
+    log.info("Shutting down Fantasy Golf API")
+    from app.services.scheduler import stop_scheduler
+    stop_scheduler()
+
+
 app = FastAPI(
     title="Fantasy Golf API",
     version="1.0.0",
-    # OpenAPI docs are available at /docs (Swagger UI) and /redoc.
-    # Useful during development; can be disabled in production.
+    lifespan=lifespan,
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
 )
