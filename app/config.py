@@ -6,7 +6,7 @@ Any variable defined here can be overridden by setting the matching environment 
 Copy .env.example to .env and fill in real values before running locally.
 """
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -31,10 +31,7 @@ class Settings(BaseSettings):
     # The frontend origin that is allowed to make cross-origin requests to the API.
     FRONTEND_URL: str = "http://localhost:5173"
 
-    class Config:
-        # Load values from a .env file in the current working directory.
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 # A single shared instance used throughout the app.
