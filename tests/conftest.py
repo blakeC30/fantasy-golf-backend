@@ -15,12 +15,17 @@ Isolation strategy: all tables are TRUNCATED after every test, giving each
 test function a completely clean slate without needing rollback gymnastics.
 """
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-TEST_DB_URL = "postgresql://fantasygolf:fantasygolf@localhost:5432/fantasygolf_test"
+TEST_DB_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql://fantasygolf:fantasygolf@localhost:5432/fantasygolf_test",
+)
 
 from app.database import get_db  # noqa: E402
 from app.main import app  # noqa: E402

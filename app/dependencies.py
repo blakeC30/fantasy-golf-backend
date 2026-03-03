@@ -6,9 +6,9 @@ Dependencies are reusable "building blocks" injected into route handlers via
 and caches results within a single request (so a dependency called from two
 places only executes once per request).
 
-Dependency chain for a protected league-admin route:
+Dependency chain for a protected league-manager route:
   route
-    └── require_league_admin(league_id, db, current_user)
+    └── require_league_manager(league_id, db, current_user)
           └── require_league_member(league_id, db, current_user)
                 └── get_current_user(token, db)
                       └── get_db()
@@ -103,22 +103,22 @@ def require_league_member(
         if pending:
             raise HTTPException(
                 status_code=403,
-                detail="Your join request is pending admin approval",
+                detail="Your join request is pending league manager approval",
             )
         raise HTTPException(status_code=403, detail="You are not a member of this league")
     return league, membership
 
 
-def require_league_admin(
+def require_league_manager(
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
 ) -> tuple[League, LeagueMember]:
     """
-    Verify the current user is a league admin.
+    Verify the current user is a league manager.
     Chains on require_league_member so the membership is checked first.
     """
     league, membership = league_and_member
-    if membership.role != LeagueMemberRole.ADMIN.value:
-        raise HTTPException(status_code=403, detail="League admin access required")
+    if membership.role != LeagueMemberRole.MANAGER.value:
+        raise HTTPException(status_code=403, detail="League manager access required")
     return league, membership
 
 

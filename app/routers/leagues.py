@@ -6,13 +6,13 @@ Endpoints:
   POST  /leagues/join/{invite_code}                       Submit a join request via invite link
   GET   /leagues/{league_id}                              Get league details (members only)
   GET   /leagues/{league_id}/members                      List approved members
-  PATCH /leagues/{league_id}/members/{user_id}/role       Change a member's role (admin only)
-  DELETE /leagues/{league_id}/members/{user_id}           Remove a member (admin only)
-  GET   /leagues/{league_id}/requests                     List pending join requests (admin only)
-  POST  /leagues/{league_id}/requests/{user_id}/approve   Approve a join request (admin only)
-  DELETE /leagues/{league_id}/requests/{user_id}          Deny/delete a join request (admin only)
+  PATCH /leagues/{league_id}/members/{user_id}/role       Change a member's role (manager only)
+  DELETE /leagues/{league_id}/members/{user_id}           Remove a member (manager only)
+  GET   /leagues/{league_id}/requests                     List pending join requests (manager only)
+  POST  /leagues/{league_id}/requests/{user_id}/approve   Approve a join request (manager only)
+  DELETE /leagues/{league_id}/requests/{user_id}          Deny/delete a join request (manager only)
   GET   /leagues/{league_id}/tournaments                  List league's selected tournaments
-  PUT   /leagues/{league_id}/tournaments                  Replace league's tournament schedule (admin only)
+  PUT   /leagues/{league_id}/tournaments                  Replace league's tournament schedule (manager only)
 """
 
 import datetime
@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_league_admin, require_league_member
+from app.dependencies import get_current_user, get_league_or_404, require_league_manager, require_league_member
 from app.models import (
     League,
     LeagueMember,
@@ -34,7 +34,7 @@ from app.models import (
     Tournament,
     User,
 )
-from app.schemas.league import LeagueCreate, LeagueMemberOut, LeagueOut, RoleUpdate
+from app.schemas.league import LeagueCreate, LeagueMemberOut, LeagueOut, LeagueUpdate, LeagueJoinPreview, LeagueRequestOut, RoleUpdate
 from app.schemas.tournament import TournamentOut
 
 router = APIRouter(prefix="/leagues", tags=["leagues"])
@@ -53,7 +53,7 @@ def create_league(
     """
     Create a new league. The creator is automatically made an approved admin.
     An active season for the current calendar year is created. All leagues are
-    private by default — joining requires an invite link and admin approval.
+    private by default — joining requires an invite link and manager approval.
     """
     league = League(
         name=body.name,
@@ -65,11 +65,11 @@ def create_league(
     db.add(league)
     db.flush()  # Get the league ID before adding related objects.
 
-    # Auto-add creator as an approved admin — no approval step needed for the founder.
+    # Auto-add creator as an approved league manager — no approval step needed for the founder.
     membership = LeagueMember(
         league_id=league.id,
         user_id=current_user.id,
-        role=LeagueMemberRole.ADMIN.value,
+        role=LeagueMemberRole.MANAGER.value,
         status=LeagueMemberStatus.APPROVED.value,
     )
     db.add(membership)
@@ -88,6 +88,66 @@ def create_league(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/join/{invite_code}", response_model=LeagueJoinPreview)
+def preview_join(
+    invite_code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Preview a league before submitting a join request.
+
+    Returns the league name, description, member count, and the current user's
+    relationship to it (None = no request, "pending" = waiting, "approved" = member).
+    Does not create or modify any records.
+    """
+    league = db.query(League).filter_by(invite_code=invite_code).first()
+    if not league:
+        raise HTTPException(status_code=404, detail="Invalid invite link — league not found")
+
+    member_count = db.query(LeagueMember).filter_by(
+        league_id=league.id, status=LeagueMemberStatus.APPROVED.value
+    ).count()
+
+    existing = db.query(LeagueMember).filter_by(
+        league_id=league.id, user_id=current_user.id
+    ).first()
+
+    return LeagueJoinPreview(
+        league_id=league.id,
+        name=league.name,
+        description=league.description,
+        member_count=member_count,
+        user_status=existing.status if existing else None,
+    )
+
+
+@router.get("/my-requests", response_model=list[LeagueRequestOut])
+def my_join_requests(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the current user's pending join requests across all leagues."""
+    rows = (
+        db.query(LeagueMember, League)
+        .join(League, LeagueMember.league_id == League.id)
+        .filter(
+            LeagueMember.user_id == current_user.id,
+            LeagueMember.status == LeagueMemberStatus.PENDING.value,
+        )
+        .all()
+    )
+    return [
+        LeagueRequestOut(
+            league_id=league.id,
+            league_name=league.name,
+            league_description=league.description,
+            requested_at=member.joined_at,
+        )
+        for member, league in rows
+    ]
+
+
 @router.post("/join/{invite_code}", response_model=LeagueMemberOut, status_code=201)
 def request_to_join(
     invite_code: str,
@@ -97,12 +157,12 @@ def request_to_join(
     """
     Submit a join request using a league's invite code.
 
-    Private leagues (default): creates a "pending" membership. An admin must
+    Private leagues (default): creates a "pending" membership. A league manager must
     approve before the user has access to the league.
 
     Public leagues (future): auto-approves and returns an "approved" membership.
 
-    The invite code is shared by league admins; it is the only way to request
+    The invite code is shared by league managers; it is the only way to request
     membership. Admins can find their invite link in the Admin panel.
     """
     league = db.query(League).filter_by(invite_code=invite_code).first()
@@ -151,6 +211,25 @@ def get_league(
     return league
 
 
+@router.patch("/{league_id}", response_model=LeagueOut)
+def update_league(
+    body: LeagueUpdate,
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
+    db: Session = Depends(get_db),
+):
+    """Update league name, description, or no_pick_penalty. Requires league manager."""
+    league, _ = league_and_manager
+    if body.name is not None:
+        league.name = body.name
+    if body.description is not None:
+        league.description = body.description
+    if body.no_pick_penalty is not None:
+        league.no_pick_penalty = body.no_pick_penalty
+    db.commit()
+    db.refresh(league)
+    return league
+
+
 @router.get("/{league_id}/members", response_model=list[LeagueMemberOut])
 def list_members(
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
@@ -170,14 +249,14 @@ def list_members(
 def update_member_role(
     user_id: uuid.UUID,
     body: RoleUpdate,
-    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
     db: Session = Depends(get_db),
 ):
-    """Change an approved member's role. Requires league admin."""
-    league, _ = league_and_admin
+    """Change an approved member's role. Requires league manager."""
+    league, _ = league_and_manager
 
-    if body.role not in (LeagueMemberRole.ADMIN.value, LeagueMemberRole.MEMBER.value):
-        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'member'")
+    if body.role not in (LeagueMemberRole.MANAGER.value, LeagueMemberRole.MEMBER.value):
+        raise HTTPException(status_code=400, detail="Role must be 'manager' or 'member'")
 
     membership = (
         db.query(LeagueMember)
@@ -197,13 +276,13 @@ def update_member_role(
 @router.delete("/{league_id}/members/{user_id}", status_code=204)
 def remove_member(
     user_id: uuid.UUID,
-    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
     db: Session = Depends(get_db),
 ):
-    """Remove an approved member from a league. Requires league admin."""
-    league, admin_membership = league_and_admin
+    """Remove an approved member from a league. Requires league manager."""
+    league, manager_membership = league_and_manager
 
-    if user_id == admin_membership.user_id:
+    if user_id == manager_membership.user_id:
         raise HTTPException(status_code=400, detail="You cannot remove yourself from the league")
 
     membership = db.query(LeagueMember).filter_by(
@@ -217,17 +296,17 @@ def remove_member(
 
 
 # ---------------------------------------------------------------------------
-# Join request management (admin only)
+# Join request management (manager only)
 # ---------------------------------------------------------------------------
 
 
 @router.get("/{league_id}/requests", response_model=list[LeagueMemberOut])
 def list_join_requests(
-    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
     db: Session = Depends(get_db),
 ):
-    """List pending join requests. Requires league admin."""
-    league, _ = league_and_admin
+    """List pending join requests. Requires league manager."""
+    league, _ = league_and_manager
     return (
         db.query(LeagueMember)
         .filter_by(league_id=league.id, status=LeagueMemberStatus.PENDING.value)
@@ -239,11 +318,11 @@ def list_join_requests(
 @router.post("/{league_id}/requests/{user_id}/approve", response_model=LeagueMemberOut)
 def approve_join_request(
     user_id: uuid.UUID,
-    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
     db: Session = Depends(get_db),
 ):
-    """Approve a pending join request. Requires league admin."""
-    league, _ = league_and_admin
+    """Approve a pending join request. Requires league manager."""
+    league, _ = league_and_manager
 
     membership = (
         db.query(LeagueMember)
@@ -260,18 +339,37 @@ def approve_join_request(
     return membership
 
 
+@router.delete("/{league_id}/requests/me", status_code=204)
+def cancel_my_join_request(
+    league: League = Depends(get_league_or_404),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cancel the current user's own pending join request."""
+    membership = db.query(LeagueMember).filter_by(
+        league_id=league.id,
+        user_id=current_user.id,
+        status=LeagueMemberStatus.PENDING.value,
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="No pending request found")
+
+    db.delete(membership)
+    db.commit()
+
+
 @router.delete("/{league_id}/requests/{user_id}", status_code=204)
 def deny_join_request(
     user_id: uuid.UUID,
-    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
     db: Session = Depends(get_db),
 ):
     """
-    Deny and delete a pending join request. Requires league admin.
+    Deny and delete a pending join request. Requires league manager.
     Denied requests are deleted rather than stored to keep the table clean
     and allow the user to request again later if needed.
     """
-    league, _ = league_and_admin
+    league, _ = league_and_manager
 
     membership = db.query(LeagueMember).filter_by(
         league_id=league.id, user_id=user_id, status=LeagueMemberStatus.PENDING.value
@@ -316,7 +414,7 @@ class TournamentScheduleUpdate(BaseModel):
 @router.put("/{league_id}/tournaments", response_model=list[TournamentOut])
 def update_league_tournaments(
     body: TournamentScheduleUpdate,
-    league_and_admin: tuple[League, LeagueMember] = Depends(require_league_admin),
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
     db: Session = Depends(get_db),
 ):
     """
@@ -324,9 +422,9 @@ def update_league_tournaments(
 
     Sends the full desired selection — existing rows not in the new list are
     deleted, new IDs are inserted. Returns the updated sorted schedule.
-    Requires league admin.
+    Requires league manager.
     """
-    league, _ = league_and_admin
+    league, _ = league_and_manager
 
     # Verify all requested tournament IDs actually exist.
     if body.tournament_ids:

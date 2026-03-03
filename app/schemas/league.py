@@ -11,8 +11,15 @@ from app.schemas.user import UserOut
 class LeagueCreate(BaseModel):
     name: str
     description: str | None = None
-    # Default matches the house rule; league admin can override on creation.
+    # Default matches the house rule; league manager can override on creation.
     no_pick_penalty: int = -50_000
+
+
+class LeagueUpdate(BaseModel):
+    """Partial update for league settings. Only provided fields are changed."""
+    name: str | None = None
+    description: str | None = None
+    no_pick_penalty: int | None = None
 
 
 class LeagueOut(BaseModel):
@@ -40,5 +47,23 @@ class LeagueMemberOut(BaseModel):
 
 
 class RoleUpdate(BaseModel):
-    """Used by league admins to change a member's role."""
-    role: str  # "admin" or "member"
+    """Used by league managers to change a member's role."""
+    role: str  # "manager" or "member"
+
+
+class LeagueJoinPreview(BaseModel):
+    """League info shown to a user before they confirm a join request."""
+    league_id: uuid.UUID
+    name: str
+    description: str | None
+    member_count: int
+    # None = no relationship, "pending" = waiting for approval, "approved" = already a member
+    user_status: str | None
+
+
+class LeagueRequestOut(BaseModel):
+    """A pending join request from the requesting user's perspective."""
+    league_id: uuid.UUID
+    league_name: str
+    league_description: str | None
+    requested_at: datetime

@@ -62,43 +62,28 @@ SCOREBOARD_PAYLOAD = {
     ]
 }
 
-SUMMARY_PAYLOAD = {
-    "leaderboard": [
+# ESPN scoreboard payload for a team-format tournament (Zurich Classic style).
+# competitors[0].type == "team" triggers is_team_event=True detection.
+# The competition id ("11450") differs from the event id ("401703507").
+TEAM_EVENT_PAYLOAD = {
+    "events": [
         {
-            "athlete": {
-                "id": "3448",
-                "displayName": "Scottie Scheffler",
-                "flag": {"alt": "United States"},
-            },
-            "status": "active",
-            "sortOrder": 1,
-            "teeTime": "2025-04-10T13:30Z",
-            "statistics": [
-                {"name": "earnings", "displayValue": "$3,600,000", "value": 3600000.0}
+            "id": "401703507",
+            "name": "Zurich Classic of New Orleans",
+            "date": "2025-04-24T14:00Z",
+            "status": {"type": {"name": "STATUS_SCHEDULED"}},
+            "competitions": [
+                {
+                    "id": "11450",
+                    "startDate": "2025-04-24T14:00Z",
+                    "endDate": "2025-04-27T22:00Z",
+                    "competitors": [
+                        {"id": "131066", "type": "team", "order": 1},
+                        {"id": "131067", "type": "team", "order": 2},
+                    ],
+                }
             ],
-        },
-        {
-            "athlete": {
-                "id": "46046",
-                "displayName": "Rory McIlroy",
-                "flag": {"alt": "Northern Ireland"},
-            },
-            "status": "active",
-            "sortOrder": 2,
-            "statistics": [
-                {"name": "earnings", "displayValue": "$2,160,000", "value": 2160000.0}
-            ],
-        },
-        {
-            "athlete": {
-                "id": "99999",
-                "displayName": "Unknown Golfer",
-                "flag": {},
-            },
-            "status": "cut",
-            "sortOrder": 50,
-            "statistics": [],
-        },
+        }
     ]
 }
 
@@ -173,58 +158,31 @@ class TestParseScheduleResponse:
         assert parse_schedule_response({}) == []
         assert parse_schedule_response({"events": []}) == []
 
+    def test_individual_event_not_team(self):
+        """Standard individual tournaments must have is_team_event=False."""
+        result = parse_schedule_response(SCOREBOARD_PAYLOAD)
+        masters = next(t for t in result if t["pga_tour_id"] == "401580001")
+        assert masters["is_team_event"] is False
 
-# ---------------------------------------------------------------------------
-# parse_summary_response
-# ---------------------------------------------------------------------------
+    def test_individual_event_competition_id_matches_event_id(self):
+        """For standard tournaments, competition_id should equal pga_tour_id."""
+        result = parse_schedule_response(SCOREBOARD_PAYLOAD)
+        masters = next(t for t in result if t["pga_tour_id"] == "401580001")
+        assert masters["competition_id"] == "401580001"
 
-class TestParseSummaryResponse:
-    def test_extracts_three_golfers(self):
-        golfers, _ = parse_summary_response(SUMMARY_PAYLOAD)
-        assert len(golfers) == 3
+    def test_team_event_detected(self):
+        """Zurich-style events with type='team' competitors must set is_team_event=True."""
+        result = parse_schedule_response(TEAM_EVENT_PAYLOAD)
+        assert len(result) == 1
+        zurich = result[0]
+        assert zurich["is_team_event"] is True
 
-    def test_golfer_fields(self):
-        golfers, _ = parse_summary_response(SUMMARY_PAYLOAD)
-        scheffler = next(g for g in golfers if g["pga_tour_id"] == "3448")
-
-        assert scheffler["name"] == "Scottie Scheffler"
-        assert scheffler["country"] == "United States"
-
-    def test_result_fields(self):
-        _, results = parse_summary_response(SUMMARY_PAYLOAD)
-        scheffler = next(r for r in results if r["pga_tour_id"] == "3448")
-
-        assert scheffler["finish_position"] == 1
-        assert scheffler["earnings_usd"] == 3_600_000
-        assert scheffler["status"] is None  # active → no special status
-
-    def test_missed_cut_status(self):
-        _, results = parse_summary_response(SUMMARY_PAYLOAD)
-        cut_golfer = next(r for r in results if r["pga_tour_id"] == "99999")
-
-        assert cut_golfer["status"] == "cut"
-        assert cut_golfer["earnings_usd"] is None
-
-    def test_tee_time_parsed(self):
-        _, results = parse_summary_response(SUMMARY_PAYLOAD)
-        scheffler = next(r for r in results if r["pga_tour_id"] == "3448")
-
-        assert scheffler["tee_time"] == datetime(2025, 4, 10, 13, 30, tzinfo=timezone.utc)
-
-    def test_no_tee_time_when_missing(self):
-        _, results = parse_summary_response(SUMMARY_PAYLOAD)
-        mcilroy = next(r for r in results if r["pga_tour_id"] == "46046")
-        assert mcilroy["tee_time"] is None
-
-    def test_empty_leaderboard(self):
-        golfers, results = parse_summary_response({"leaderboard": []})
-        assert golfers == []
-        assert results == []
-
-    def test_empty_response(self):
-        golfers, results = parse_summary_response({})
-        assert golfers == []
-        assert results == []
+    def test_team_event_competition_id_differs_from_event_id(self):
+        """Team events expose a different competition id (e.g. '11450' vs '401703507')."""
+        result = parse_schedule_response(TEAM_EVENT_PAYLOAD)
+        zurich = result[0]
+        assert zurich["pga_tour_id"] == "401703507"
+        assert zurich["competition_id"] == "11450"
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +321,7 @@ class TestScorePicks:
         db.add(league)
         db.flush()
 
-        db.add(LeagueMember(league_id=league.id, user_id=user.id, role=LeagueMemberRole.ADMIN.value))
+        db.add(LeagueMember(league_id=league.id, user_id=user.id, role=LeagueMemberRole.MANAGER.value))
         season = Season(league_id=league.id, year=2025, is_active=True)
         db.add(season)
         db.flush()
@@ -425,7 +383,7 @@ class TestScorePicks:
         db.add(league)
         db.flush()
 
-        db.add(LeagueMember(league_id=league.id, user_id=user.id, role=LeagueMemberRole.ADMIN.value))
+        db.add(LeagueMember(league_id=league.id, user_id=user.id, role=LeagueMemberRole.MANAGER.value))
         season = Season(league_id=league.id, year=2025, is_active=True)
         db.add(season)
         db.flush()

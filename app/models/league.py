@@ -6,17 +6,17 @@ the platform simultaneously — each has its own members, seasons, and standings
 
 LeagueMember is the join table between User and League. It also stores the
 user's role and membership status:
-  - role:   "admin" | "member"
-  - status: "pending" (awaiting admin approval) | "approved" (active member)
+  - role:   "manager" | "member"
+  - status: "pending" (awaiting manager approval) | "approved" (active member)
 
-Joining a private league creates a "pending" membership. The admin then
+Joining a private league creates a "pending" membership. The league manager then
 approves or denies via the /leagues/{league_id}/requests endpoints. Public leagues
 (is_public=True) auto-approve on join — but all leagues are currently created
 as private; the is_public field exists for future use.
 
 Invite flow: each league has a unique invite_code (random 22-char URL-safe
-string). Admins share this code as a join link: /join/{invite_code}. The code
-doesn't change unless the admin explicitly regenerates it.
+string). League managers share this code as a join link: /join/{invite_code}.
+The code doesn't change unless the manager explicitly regenerates it.
 """
 
 import enum
@@ -46,16 +46,16 @@ class LeagueMemberRole(str, enum.Enum):
     Inheriting from str makes the enum JSON-serializable and lets SQLAlchemy
     store it as a plain string in the database.
     """
-    ADMIN = "admin"    # Can manage members, settings, and trigger syncs
-    MEMBER = "member"  # Can view and submit picks
+    MANAGER = "manager"  # Can manage members, settings, and tournament schedule
+    MEMBER = "member"    # Can view and submit picks
 
 
 class LeagueMemberStatus(str, enum.Enum):
     """
     Membership lifecycle state.
 
-    PENDING  — user has submitted a join request; awaiting admin action.
-    APPROVED — admin accepted the request; user is a full active member.
+    PENDING  — user has submitted a join request; awaiting manager action.
+    APPROVED — manager accepted the request; user is a full active member.
 
     Denied requests are simply deleted (not stored with a "denied" status)
     to keep the table small and not confuse future join attempts.
@@ -88,8 +88,8 @@ class League(Base):
         server_default=text("gen_random_uuid()::text"),
     )
 
-    # When True, join requests are auto-approved; no admin action required.
-    # When False (default), every join request must be approved by an admin.
+    # When True, join requests are auto-approved; no manager action required.
+    # When False (default), every join request must be approved by a league manager.
     # The UI always creates private leagues for now; this field is here for
     # future public-league functionality.
     is_public: Mapped[bool] = mapped_column(
@@ -99,7 +99,7 @@ class League(Base):
         server_default="false",
     )
 
-    # The user who created the league. They are automatically made an admin.
+    # The user who created the league. They are automatically made a league manager.
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -142,7 +142,7 @@ class LeagueMember(Base):
     league_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("leagues.id"), nullable=False)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
 
-    # Stored as a plain string ("admin" or "member") using the enum's value.
+    # Stored as a plain string ("manager" or "member") using the enum's value.
     role: Mapped[str] = mapped_column(
         String(20),
         default=LeagueMemberRole.MEMBER.value,
@@ -150,7 +150,7 @@ class LeagueMember(Base):
         nullable=False,
     )
 
-    # "pending" until an admin approves the join request; then "approved".
+    # "pending" until a league manager approves the join request; then "approved".
     # server_default="approved" so existing rows (admin-created) stay valid.
     status: Mapped[str] = mapped_column(
         String(20),

@@ -16,7 +16,7 @@ import datetime
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import League, LeagueMember, LeagueTournament, Pick, Season, Tournament, TournamentStatus
+from app.models import League, LeagueMember, LeagueMemberStatus, LeagueTournament, Pick, Season, Tournament, TournamentStatus
 
 
 def calculate_standings(db: Session, league: League, season: Season) -> list[dict]:
@@ -46,10 +46,10 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
     )
     completed_ids = {t.id for t in season_tournaments}
 
-    # All members of this league, with their user record loaded in one query.
+    # Only approved members appear in standings — pending requests are excluded.
     members = (
         db.query(LeagueMember)
-        .filter_by(league_id=league.id)
+        .filter_by(league_id=league.id, status=LeagueMemberStatus.APPROVED.value)
         .options(joinedload(LeagueMember.user))
         .all()
     )

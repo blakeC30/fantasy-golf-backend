@@ -106,9 +106,9 @@ def seed():
         db.add(league)
         db.flush()
 
-        # Add all four users as members; Alice is admin.
+        # Add all four users as members; Alice is league manager.
         memberships = [
-            LeagueMember(league_id=league.id, user_id=alice.id, role=LeagueMemberRole.ADMIN.value),
+            LeagueMember(league_id=league.id, user_id=alice.id, role=LeagueMemberRole.MANAGER.value),
             LeagueMember(league_id=league.id, user_id=bob.id, role=LeagueMemberRole.MEMBER.value),
             LeagueMember(league_id=league.id, user_id=carol.id, role=LeagueMemberRole.MEMBER.value),
             LeagueMember(league_id=league.id, user_id=admin.id, role=LeagueMemberRole.MEMBER.value),
@@ -287,7 +287,7 @@ def seed():
         print("\nSeed complete!")
         print(f"  League:      '{league.name}' (id: {league.id})")
         print(f"  Season:      {current_year}")
-        print(f"  Users:       alice@example.com (admin), bob@example.com, carol@example.com")
+        print(f"  Users:       alice@example.com (league manager), bob@example.com, carol@example.com")
         print(f"  Password:    password123 (all users)")
         print(f"  Tournaments: {tournament_regular.name}, {tournament_major.name}, {tournament_upcoming.name}")
         print(f"  Golfers:     {len(golfers)} golfers seeded")

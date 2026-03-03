@@ -16,6 +16,7 @@ from app.models import (
     League,
     LeagueMember,
     LeagueMemberRole,
+    LeagueTournament,
     Pick,
     Season,
     Tournament,
@@ -46,7 +47,7 @@ def make_league(db: Session, creator: User) -> tuple[League, Season]:
     db.add(league)
     db.flush()  # flush so league.id is populated before we reference it below
 
-    db.add(LeagueMember(league_id=league.id, user_id=creator.id, role=LeagueMemberRole.ADMIN.value))
+    db.add(LeagueMember(league_id=league.id, user_id=creator.id, role=LeagueMemberRole.MANAGER.value))
     season = Season(league_id=league.id, year=date.today().year, is_active=True)
     db.add(season)
     db.commit()
@@ -63,7 +64,9 @@ def make_golfer(db: Session, name: str = "Test Golfer") -> Golfer:
     return golfer
 
 
-def make_tournament(db: Session, days_from_now: int = 3) -> Tournament:
+def make_tournament(
+    db: Session, days_from_now: int = 3, league: League | None = None
+) -> Tournament:
     start = date.today() + timedelta(days=days_from_now)
     t = Tournament(
         pga_tour_id=f"R{uuid.uuid4().hex[:6]}",
@@ -74,6 +77,9 @@ def make_tournament(db: Session, days_from_now: int = 3) -> Tournament:
         multiplier=1.0,
     )
     db.add(t)
+    db.flush()
+    if league is not None:
+        db.add(LeagueTournament(league_id=league.id, tournament_id=t.id))
     db.commit()
     db.refresh(t)
     return t
@@ -96,7 +102,7 @@ class TestSubmitPick:
         user = db.query(User).filter_by(email="test@example.com").first()
         league, season = make_league(db, user)
         golfer = make_golfer(db)
-        tournament = make_tournament(db, days_from_now=7)
+        tournament = make_tournament(db, days_from_now=7, league=league)
         add_golfer_to_tournament(db, tournament, golfer)
 
         resp = client.post(
@@ -115,8 +121,8 @@ class TestSubmitPick:
         league, season = make_league(db, user)
         golfer = make_golfer(db)
 
-        t1 = make_tournament(db, days_from_now=7)
-        t2 = make_tournament(db, days_from_now=14)
+        t1 = make_tournament(db, days_from_now=7, league=league)
+        t2 = make_tournament(db, days_from_now=14, league=league)
         add_golfer_to_tournament(db, t1, golfer)
         add_golfer_to_tournament(db, t2, golfer)
 
@@ -143,7 +149,7 @@ class TestSubmitPick:
         golfer = make_golfer(db)
 
         # Tournament that started yesterday.
-        past_tournament = make_tournament(db, days_from_now=-1)
+        past_tournament = make_tournament(db, days_from_now=-1, league=league)
         add_golfer_to_tournament(db, past_tournament, golfer)
 
         resp = client.post(
@@ -158,7 +164,7 @@ class TestSubmitPick:
         user = db.query(User).filter_by(email="test@example.com").first()
         league, season = make_league(db, user)
         golfer = make_golfer(db)
-        tournament = make_tournament(db, days_from_now=7)
+        tournament = make_tournament(db, days_from_now=7, league=league)
         # Intentionally NOT adding golfer to tournament.
 
         resp = client.post(

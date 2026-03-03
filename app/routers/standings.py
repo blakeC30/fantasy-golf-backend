@@ -33,17 +33,27 @@ def get_standings(
     league, _ = league_and_member
     raw_rows = calculate_standings(db, league, season)
 
-    rows = [
-        StandingsRow(
-            rank=i + 1,
-            user_id=row["user_id"],
-            display_name=row["display_name"],
-            total_points=row["total_points"],
-            pick_count=row["pick_count"],
-            missed_count=row["missed_count"],
+    # Competition ranking (golf-style):
+    #   Tied players share the rank of their group's first position, and the
+    #   next rank skips over the tied spots.
+    #   Example: scores [100, 80, 80, 60] → ranks [1, 2, 2, 4]
+    #            is_tied                  → [F, T, T, F]
+    rows = []
+    for row in raw_rows:
+        pts = row["total_points"]
+        rank = sum(1 for r in raw_rows if r["total_points"] > pts) + 1
+        is_tied = sum(1 for r in raw_rows if r["total_points"] == pts) > 1
+        rows.append(
+            StandingsRow(
+                rank=rank,
+                is_tied=is_tied,
+                user_id=row["user_id"],
+                display_name=row["display_name"],
+                total_points=row["total_points"],
+                pick_count=row["pick_count"],
+                missed_count=row["missed_count"],
+            )
         )
-        for i, row in enumerate(raw_rows)
-    ]
 
     return StandingsResponse(
         league_id=league.id,
