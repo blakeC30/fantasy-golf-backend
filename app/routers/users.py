@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models import League, LeagueMember, User
+from app.models import League, LeagueMember, LeagueMemberStatus, User
 from app.schemas.league import LeagueOut
 from app.schemas.user import UserOut, UserUpdate
 
@@ -42,10 +42,10 @@ def get_my_leagues(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return all leagues the current user is a member of."""
+    """Return all leagues where the current user is an approved member."""
     memberships = (
         db.query(LeagueMember)
-        .filter_by(user_id=current_user.id)
+        .filter_by(user_id=current_user.id, status=LeagueMemberStatus.APPROVED.value)
         .options(joinedload(LeagueMember.league))
         .all()
     )

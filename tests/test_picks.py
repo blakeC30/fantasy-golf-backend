@@ -41,7 +41,6 @@ def make_user(db: Session, email: str, display_name: str = "Test") -> User:
 def make_league(db: Session, creator: User) -> tuple[League, Season]:
     league = League(
         name="Test League",
-        slug=f"test-{uuid.uuid4().hex[:8]}",
         created_by=creator.id,
     )
     db.add(league)
@@ -101,7 +100,7 @@ class TestSubmitPick:
         add_golfer_to_tournament(db, tournament, golfer)
 
         resp = client.post(
-            f"/api/v1/leagues/{league.slug}/picks",
+            f"/api/v1/leagues/{league.id}/picks",
             headers=auth_headers,
             json={"tournament_id": str(tournament.id), "golfer_id": str(golfer.id)},
         )
@@ -123,7 +122,7 @@ class TestSubmitPick:
 
         # First pick succeeds.
         resp1 = client.post(
-            f"/api/v1/leagues/{league.slug}/picks",
+            f"/api/v1/leagues/{league.id}/picks",
             headers=auth_headers,
             json={"tournament_id": str(t1.id), "golfer_id": str(golfer.id)},
         )
@@ -131,7 +130,7 @@ class TestSubmitPick:
 
         # Same golfer for a different tournament should fail.
         resp2 = client.post(
-            f"/api/v1/leagues/{league.slug}/picks",
+            f"/api/v1/leagues/{league.id}/picks",
             headers=auth_headers,
             json={"tournament_id": str(t2.id), "golfer_id": str(golfer.id)},
         )
@@ -148,7 +147,7 @@ class TestSubmitPick:
         add_golfer_to_tournament(db, past_tournament, golfer)
 
         resp = client.post(
-            f"/api/v1/leagues/{league.slug}/picks",
+            f"/api/v1/leagues/{league.id}/picks",
             headers=auth_headers,
             json={"tournament_id": str(past_tournament.id), "golfer_id": str(golfer.id)},
         )
@@ -163,7 +162,7 @@ class TestSubmitPick:
         # Intentionally NOT adding golfer to tournament.
 
         resp = client.post(
-            f"/api/v1/leagues/{league.slug}/picks",
+            f"/api/v1/leagues/{league.id}/picks",
             headers=auth_headers,
             json={"tournament_id": str(tournament.id), "golfer_id": str(golfer.id)},
         )
@@ -191,7 +190,7 @@ class TestSubmitPick:
         headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
         resp = client.post(
-            f"/api/v1/leagues/{league.slug}/picks",
+            f"/api/v1/leagues/{league.id}/picks",
             headers=headers,
             json={"tournament_id": str(tournament.id), "golfer_id": str(golfer.id)},
         )

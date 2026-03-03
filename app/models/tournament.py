@@ -29,6 +29,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -106,6 +107,19 @@ class Tournament(Base):
         server_default=TournamentStatus.SCHEDULED.value,
     )
 
+    # ESPN competition ID for this event. For most tournaments this equals
+    # pga_tour_id, but team-format events (e.g. Zurich Classic) use a different
+    # competition ID in the core API. Stored here so scraper calls use the
+    # correct ID without re-fetching the scoreboard on every sync.
+    competition_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # True for two-person team format tournaments (e.g. Zurich Classic).
+    # Drives scraper routing: team events need roster expansion + officialAmount
+    # earnings stat (divided by 2) instead of the standard per-athlete flow.
+    is_team_event: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -163,6 +177,12 @@ class TournamentEntry(Base):
 
     # Withdrawal, cut, disqualification, etc. Null while tournament is active.
     status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # For team events: the ESPN team competitor ID (e.g. "131066" for the team
+    # "Novak/Griffin"). Used by score_picks to call the correct earnings endpoint:
+    # /competitors/{team_competitor_id}/statistics rather than /competitors/{athlete_id}.
+    # Null for individual (non-team) tournaments.
+    team_competitor_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     # --- Relationships ---
     tournament: Mapped["Tournament"] = relationship(back_populates="entries")

@@ -5,8 +5,7 @@ These are unit tests — no HTTP is made. httpx calls are intercepted by
 pytest-httpx (or unittest.mock) so tests run without a network connection.
 
 What's tested here:
-  - parse_schedule_response()  — JSON → tournament dicts
-  - parse_summary_response()   — JSON → golfer + result dicts
+  - parse_schedule_response()  — JSON → tournament dicts (including team event detection)
   - upsert_tournaments()       — create new / update existing tournament rows
   - upsert_field()             — create new / update existing golfer + entry rows
   - score_picks()              — points_earned set correctly after results land
@@ -24,7 +23,6 @@ from app.services.scraper import (
     _map_espn_status,
     _parse_date,
     parse_schedule_response,
-    parse_summary_response,
     score_picks,
     upsert_field,
     upsert_tournaments,
@@ -361,7 +359,7 @@ class TestScorePicks:
         db.add(user)
         db.flush()
 
-        league = League(name="SL", slug="score-league", created_by=user.id)
+        league = League(name="SL", created_by=user.id)
         db.add(league)
         db.flush()
 
@@ -423,7 +421,7 @@ class TestScorePicks:
         db.add(user)
         db.flush()
 
-        league = League(name="CL", slug="cut-league", created_by=user.id)
+        league = League(name="CL", created_by=user.id)
         db.add(league)
         db.flush()
 

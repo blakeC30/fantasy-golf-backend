@@ -6,7 +6,7 @@ Import all models here so that:
 
 from app.models.base import Base
 from app.models.user import User
-from app.models.league import League, LeagueMember, LeagueMemberRole
+from app.models.league import League, LeagueMember, LeagueMemberRole, LeagueMemberStatus
 from app.models.season import Season
 from app.models.golfer import Golfer
 from app.models.tournament import Tournament, TournamentEntry, TournamentStatus
@@ -19,6 +19,7 @@ __all__ = [
     "League",
     "LeagueMember",
     "LeagueMemberRole",
+    "LeagueMemberStatus",
     "Season",
     "Golfer",
     "Tournament",

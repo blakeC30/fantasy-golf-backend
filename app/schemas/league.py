@@ -10,7 +10,6 @@ from app.schemas.user import UserOut
 
 class LeagueCreate(BaseModel):
     name: str
-    slug: str
     description: str | None = None
     # Default matches the house rule; league admin can override on creation.
     no_pick_penalty: int = -50_000
@@ -19,9 +18,10 @@ class LeagueCreate(BaseModel):
 class LeagueOut(BaseModel):
     id: uuid.UUID
     name: str
-    slug: str
     description: str | None
     no_pick_penalty: int
+    invite_code: str
+    is_public: bool
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -32,6 +32,7 @@ class LeagueMemberOut(BaseModel):
     user_id: uuid.UUID
     league_id: uuid.UUID
     role: str
+    status: str
     joined_at: datetime
     user: UserOut
 

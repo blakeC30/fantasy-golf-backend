@@ -8,8 +8,8 @@ places only executes once per request).
 
 Dependency chain for a protected league-admin route:
   route
-    └── require_league_admin(slug, db, current_user)
-          └── require_league_member(slug, db, current_user)
+    └── require_league_admin(league_id, db, current_user)
+          └── require_league_member(league_id, db, current_user)
                 └── get_current_user(token, db)
                       └── get_db()
 """
@@ -22,7 +22,7 @@ from jose import JWTError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import League, LeagueMember, LeagueMemberRole, Season, User
+from app.models import League, LeagueMember, LeagueMemberRole, LeagueMemberStatus, Season, User
 from app.services.auth import decode_access_token
 
 # HTTPBearer extracts "Bearer <token>" from the Authorization header.
@@ -63,17 +63,17 @@ def require_platform_admin(
     return current_user
 
 
-def get_league_or_404(slug: str, db: Session = Depends(get_db)) -> League:
+def get_league_or_404(league_id: uuid.UUID, db: Session = Depends(get_db)) -> League:
     """
-    Look up a league by its URL slug.
+    Look up a league by its UUID primary key.
 
-    FastAPI automatically injects `slug` from the route path parameter
-    (e.g. `/leagues/{slug}/...`). This dependency is reused by member and
+    FastAPI automatically injects `league_id` from the route path parameter
+    (e.g. `/leagues/{league_id}/...`). This dependency is reused by member and
     admin checks so the league is only fetched once per request.
     """
-    league = db.query(League).filter_by(slug=slug).first()
+    league = db.query(League).filter_by(id=league_id).first()
     if not league:
-        raise HTTPException(status_code=404, detail=f"League '{slug}' not found")
+        raise HTTPException(status_code=404, detail=f"League '{league_id}' not found")
     return league
 
 
@@ -88,10 +88,23 @@ def require_league_member(
     """
     membership = (
         db.query(LeagueMember)
-        .filter_by(league_id=league.id, user_id=current_user.id)
+        .filter_by(
+            league_id=league.id,
+            user_id=current_user.id,
+            status=LeagueMemberStatus.APPROVED.value,
+        )
         .first()
     )
     if not membership:
+        # Check if there's a pending request so we can give a clearer error.
+        pending = db.query(LeagueMember).filter_by(
+            league_id=league.id, user_id=current_user.id
+        ).first()
+        if pending:
+            raise HTTPException(
+                status_code=403,
+                detail="Your join request is pending admin approval",
+            )
         raise HTTPException(status_code=403, detail="You are not a member of this league")
     return league, membership
 

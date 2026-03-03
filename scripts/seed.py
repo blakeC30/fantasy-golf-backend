@@ -99,7 +99,6 @@ def seed():
 
         league = League(
             name="Augusta Pines Fantasy Golf",
-            slug="augusta-pines",
             description="A friendly fantasy golf league for friends and colleagues.",
             created_by=alice.id,
             no_pick_penalty=-50_000,
@@ -286,7 +285,7 @@ def seed():
 
         db.commit()
         print("\nSeed complete!")
-        print(f"  League:      '{league.name}' (slug: {league.slug})")
+        print(f"  League:      '{league.name}' (id: {league.id})")
         print(f"  Season:      {current_year}")
         print(f"  Users:       alice@example.com (admin), bob@example.com, carol@example.com")
         print(f"  Password:    password123 (all users)")

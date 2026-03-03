@@ -1,8 +1,8 @@
 """
-Standings router — /leagues/{slug}/standings
+Standings router — /leagues/{league_id}/standings
 
 Endpoints:
-  GET /leagues/{slug}/standings   Current season standings for the league
+  GET /leagues/{league_id}/standings   Current season standings for the league
 """
 
 from fastapi import APIRouter, Depends
@@ -14,7 +14,7 @@ from app.services.scoring import calculate_standings
 from app.database import get_db
 from sqlalchemy.orm import Session
 
-router = APIRouter(prefix="/leagues/{slug}/standings", tags=["standings"])
+router = APIRouter(prefix="/leagues/{league_id}/standings", tags=["standings"])
 
 
 @router.get("", response_model=StandingsResponse)

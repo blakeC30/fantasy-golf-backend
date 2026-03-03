@@ -15,5 +15,6 @@ class TournamentOut(BaseModel):
     multiplier: float
     purse_usd: int | None
     status: str
+    is_team_event: bool
 
     model_config = ConfigDict(from_attributes=True)

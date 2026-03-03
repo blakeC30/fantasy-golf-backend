@@ -28,12 +28,20 @@ ESPN API endpoints used
              ?dates={YYYY}  → all events for that calendar year
 
   Core API:  https://sports.core.api.espn.com/v2/sports/golf/leagues/pga/...
-             /events/{id}/competitions/{id}/competitors?limit=200
-               → all golfers in the field with finish order
-             /events/{id}/competitions/{id}/competitors/{athlete_id}/statistics
-               → earnings for completed tournaments
+             /events/{id}/competitions/{competition_id}/competitors?limit=200
+               → all golfers/teams in the field with finish order
+             /competitions/{competition_id}/competitors/{team_id}/roster
+               → individual athlete IDs for a team competitor (team events only)
+             /events/{id}/competitions/{competition_id}/competitors/{competitor_id}/statistics
+               → earnings for completed tournaments; team events use 'officialAmount'
+               stat (divided by 2 for per-golfer share); individual events use 'amount'
              /athletes/{athlete_id}
                → golfer name and country
+
+  NOTE: For most tournaments, competition_id == pga_tour_id (event ID).
+  Team-format events (e.g. Zurich Classic) use a DIFFERENT competition_id
+  exposed in the scoreboard as competitions[0].id. The scraper stores this
+  in Tournament.competition_id so subsequent calls use the correct ID.
 
 Note: The older summary endpoint (site.api.espn.com/...pga/summary?event=)
 is no longer functional — it returns ESPN error code 2500 for all event IDs.
@@ -105,7 +113,7 @@ def _fetch_tournament_data(
     known_golfer_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Fetch the golfer field and finish order for one tournament.
+    Fetch the golfer field and finish order for one individual (non-team) tournament.
 
     Uses the ESPN core API competitors endpoint (event-specific, unlike the
     web scoreboard which ignores the event parameter). One request gets all
@@ -116,7 +124,8 @@ def _fetch_tournament_data(
     the golfers users actually picked (1 API call per pick, not per field).
 
     Args:
-      pga_tour_id:       ESPN event ID for the tournament.
+      pga_tour_id:       ESPN event ID for the tournament (also the competition ID
+                         for individual tournaments).
       known_golfer_ids:  pga_tour_ids already in the DB; skips re-fetching them.
 
     Returns:
@@ -179,22 +188,157 @@ def _fetch_tournament_data(
             "earnings_usd": None,
             "status": None,
             "tee_time": None,
+            "team_competitor_id": None,
         })
 
     return golfers, results
 
 
-def _fetch_golfer_earnings(pga_tour_id: str, athlete_id: str) -> int | None:
+def _fetch_team_roster(competition_id: str, team_competitor_id: str) -> list[str]:
     """
-    Fetch prize earnings for one golfer in one tournament from the ESPN core API.
+    Fetch the individual athlete IDs for one team competitor.
+
+    The Zurich Classic (and any future team-format events) lists teams as
+    competitors rather than individual golfers. This sub-endpoint expands a
+    team into its individual player IDs so we can create proper Golfer rows.
+
+    Returns a list of pga_tour_id strings (individual athlete IDs).
+    """
+    url = (
+        f"{_CORE_API_BASE}/competitions/{competition_id}"
+        f"/competitors/{team_competitor_id}/roster"
+    )
+    try:
+        data = _get_json(url)
+        return [str(e["playerId"]) for e in data.get("entries", []) if e.get("playerId")]
+    except (httpx.HTTPError, httpx.RequestError) as exc:
+        log.warning(
+            "Could not fetch roster for team %s in competition %s: %s",
+            team_competitor_id, competition_id, exc,
+        )
+        return []
+
+
+def _fetch_team_field(
+    pga_tour_id: str,
+    competition_id: str,
+    known_golfer_ids: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Fetch the individual golfer field for a team-format tournament.
+
+    Team events (e.g. Zurich Classic) list team competitors instead of
+    individual athletes. This function:
+      1. Fetches all team competitors for the competition.
+      2. Expands each team into its two individual athlete IDs via the roster
+         sub-endpoint.
+      3. Fetches athlete info (name, country) concurrently for new golfers.
+      4. Returns golfers + results lists with team_competitor_id set on each
+         entry so score_picks can use the correct earnings endpoint later.
+
+    Args:
+      pga_tour_id:       ESPN event ID (used in earnings API URL).
+      competition_id:    ESPN competition ID (may differ from pga_tour_id for
+                         team events — stored in Tournament.competition_id).
+      known_golfer_ids:  pga_tour_ids already in the DB; skips re-fetching them.
+
+    Returns:
+      golfers  — list of dicts (one per individual golfer, not per team)
+      results  — list of dicts (one per individual golfer, with team_competitor_id)
+    """
+    competitors_url = (
+        f"{_CORE_API_BASE}/events/{pga_tour_id}"
+        f"/competitions/{competition_id}/competitors"
+    )
+    data = _get_json(competitors_url, params={"limit": 200})
+    team_competitors = data.get("items", [])
+
+    if not team_competitors:
+        log.warning("No team competitors found for tournament %s (competition %s)", pga_tour_id, competition_id)
+        return [], []
+
+    known = known_golfer_ids or set()
+
+    # Expand each team into individual athlete IDs, preserving team_competitor_id.
+    # team_entries: list of (athlete_id, team_competitor_id, finish_order)
+    team_entries: list[tuple[str, str, int | None]] = []
+    for team in team_competitors:
+        team_id = str(team.get("id", ""))
+        if not team_id:
+            continue
+        finish_order = team.get("order")
+        athlete_ids = _fetch_team_roster(competition_id, team_id)
+        for athlete_id in athlete_ids:
+            team_entries.append((athlete_id, team_id, finish_order))
+
+    # Fetch athlete info for golfers not already in DB.
+    ids_to_fetch = [aid for aid, _, _ in team_entries if aid not in known]
+    athlete_info: dict[str, dict] = {}
+    if ids_to_fetch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures = {pool.submit(_fetch_athlete_info, aid): aid for aid in ids_to_fetch}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    info = future.result()
+                    athlete_info[info["pga_tour_id"]] = info
+                except Exception as exc:
+                    log.warning("Athlete fetch failed: %s", exc)
+
+    log.info(
+        "Team tournament %s: %d teams → %d individual golfers, %d new athlete fetches",
+        pga_tour_id, len(team_competitors), len(team_entries), len(ids_to_fetch),
+    )
+
+    golfers: list[dict] = []
+    results: list[dict] = []
+    for athlete_id, team_id, finish_order in team_entries:
+        info = athlete_info.get(athlete_id)
+        golfers.append({
+            "pga_tour_id": athlete_id,
+            "name": info["name"] if info else None,
+            "country": info["country"] if info else None,
+        })
+        results.append({
+            "pga_tour_id": athlete_id,
+            "finish_position": finish_order,
+            "earnings_usd": None,
+            "status": None,
+            "tee_time": None,
+            "team_competitor_id": team_id,
+        })
+
+    return golfers, results
+
+
+def _fetch_golfer_earnings(
+    pga_tour_id: str,
+    competitor_id: str,
+    competition_id: str | None = None,
+    is_team_event: bool = False,
+) -> int | None:
+    """
+    Fetch prize earnings for one pick from the ESPN core API.
 
     Called by score_picks() only for golfers that have actual picks — keeps
     total API requests low (one per league member who submitted a pick).
+
+    For individual tournaments:
+      - competitor_id is the golfer's pga_tour_id
+      - stat name is 'amount'
+      - competition_id defaults to pga_tour_id
+
+    For team tournaments (e.g. Zurich Classic):
+      - competitor_id is the team's ESPN competitor ID (team_competitor_id)
+      - stat name is 'officialAmount' (ESPN sets 'amount' to 0 for team events)
+      - earnings are the TEAM's total purse; divide by 2 for per-golfer share
+      - competition_id is the event's actual competition ID (stored in Tournament)
+
     Returns earnings in USD as an integer, or None if not found.
     """
+    effective_competition_id = competition_id or pga_tour_id
     stats_url = (
         f"{_CORE_API_BASE}/events/{pga_tour_id}"
-        f"/competitions/{pga_tour_id}/competitors/{athlete_id}/statistics"
+        f"/competitions/{effective_competition_id}/competitors/{competitor_id}/statistics"
     )
     try:
         with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
@@ -203,17 +347,22 @@ def _fetch_golfer_earnings(pga_tour_id: str, athlete_id: str) -> int | None:
                 return None
             stats_data = resp.json()
     except httpx.RequestError as exc:
-        log.warning("Could not fetch earnings for athlete %s: %s", athlete_id, exc)
+        log.warning("Could not fetch earnings for competitor %s: %s", competitor_id, exc)
         return None
+
+    stat_name = "officialAmount" if is_team_event else "amount"
 
     for cat in stats_data.get("splits", {}).get("categories", []):
         for stat in cat.get("stats", []):
-            if stat.get("name") == "amount":
+            if stat.get("name") == stat_name:
                 raw = stat.get("value")
                 if raw is not None:
                     try:
                         val = int(float(raw))
-                        return val if val > 0 else None
+                        if val > 0:
+                            # Team events: officialAmount is the team's combined prize;
+                            # each golfer earns half.
+                            return val // 2 if is_team_event else val
                     except (ValueError, TypeError):
                         pass
     return None
@@ -251,6 +400,14 @@ def parse_schedule_response(data: dict) -> list[dict]:
 
     ESPN wraps events under either data['events'] or data['leagues'][i]['events'].
     We check both. Returns a list of dicts ready to be upserted as Tournament rows.
+
+    For each event we also extract:
+      competition_id  — the ESPN competition ID, which may differ from the event ID
+                        for team-format events (e.g. Zurich Classic uses "11450")
+      is_team_event   — True if the scoreboard lists type="team" competitors
+
+    These two fields allow sync_tournament to use the correct API endpoints
+    without re-fetching the scoreboard on every field sync.
     """
     # Collect raw events from whichever nesting ESPN uses.
     raw_events: list[dict] = data.get("events", [])
@@ -279,8 +436,19 @@ def parse_schedule_response(data: dict) -> list[dict]:
         if not end_date:
             end_date = start_date + timedelta(days=3)
 
+        # Extract competition_id — for team events this differs from event_id.
+        competition_id = str(comp.get("id") or event_id)
+
+        # Detect team format: ESPN marks team-event competitors with type="team".
+        competitors_sample = comp.get("competitors") or []
+        is_team_event = bool(
+            competitors_sample and competitors_sample[0].get("type") == "team"
+        )
+
         results.append({
             "pga_tour_id": str(event_id),
+            "competition_id": competition_id,
+            "is_team_event": is_team_event,
             "name": event.get("name") or event.get("shortName", "Unknown Tournament"),
             "start_date": start_date,
             "end_date": end_date,
@@ -306,6 +474,10 @@ def upsert_tournaments(db: Session, parsed: list[dict]) -> tuple[int, int]:
     Only mutable fields (name, end_date, status) are updated on an existing
     row. multiplier is NOT overwritten because platform admins set it manually
     for majors and we don't want a sync to reset it.
+
+    competition_id and is_team_event are set on creation and updated only if
+    competition_id is not already set (safe to re-run; avoids overwriting
+    manually corrected values).
     """
     created, updated = 0, 0
     for item in parsed:
@@ -315,9 +487,22 @@ def upsert_tournaments(db: Session, parsed: list[dict]) -> tuple[int, int]:
             existing.start_date = item["start_date"]
             existing.end_date = item["end_date"]
             existing.status = item["status"]
+            # Only update team-event fields if not yet set (preserves manual corrections).
+            if existing.competition_id is None:
+                existing.competition_id = item.get("competition_id")
+                existing.is_team_event = item.get("is_team_event", False)
             updated += 1
         else:
-            db.add(Tournament(**item))
+            db.add(Tournament(
+                pga_tour_id=item["pga_tour_id"],
+                competition_id=item.get("competition_id"),
+                is_team_event=item.get("is_team_event", False),
+                name=item["name"],
+                start_date=item["start_date"],
+                end_date=item["end_date"],
+                status=item["status"],
+                multiplier=item.get("multiplier", 1.0),
+            ))
             created += 1
     db.commit()
     return created, updated
@@ -334,6 +519,8 @@ def upsert_field(
     Returns (golfers_synced, entries_synced).
 
     results is a parallel list to golfers (same pga_tour_id key links them).
+    For team events each result dict includes team_competitor_id, which is
+    stored on the entry so score_picks can call the correct earnings endpoint.
     """
     results_by_id = {r["pga_tour_id"]: r for r in results}
 
@@ -375,6 +562,8 @@ def upsert_field(
                 entry.status = result["status"]
             if result.get("tee_time") is not None:
                 entry.tee_time = result["tee_time"]
+            if result.get("team_competitor_id") is not None:
+                entry.team_competitor_id = result["team_competitor_id"]
         else:
             entry = TournamentEntry(
                 tournament_id=tournament.id,
@@ -383,6 +572,7 @@ def upsert_field(
                 earnings_usd=result.get("earnings_usd"),
                 status=result.get("status"),
                 tee_time=result.get("tee_time"),
+                team_competitor_id=result.get("team_competitor_id"),
             )
             db.add(entry)
             entries_synced += 1
@@ -405,6 +595,13 @@ def score_picks(db: Session, tournament: Tournament) -> int:
       points_earned = earnings_usd * tournament.multiplier
 
     If the golfer missed the cut (no earnings), points_earned = 0.
+
+    Team events (e.g. Zurich Classic):
+      The earnings endpoint uses the team's ESPN competitor ID, not the
+      individual golfer's ID. We look this up from TournamentEntry.team_competitor_id.
+      ESPN reports team earnings under 'officialAmount'; we divide by 2 for
+      each golfer's individual share.
+
     Returns the number of picks scored.
     """
     if tournament.status != TournamentStatus.COMPLETED.value:
@@ -425,10 +622,22 @@ def score_picks(db: Session, tournament: Tournament) -> int:
             # Already stored from a previous sync — use it directly.
             earnings = float(entry.earnings_usd)
         else:
-            # Not stored yet — fetch from ESPN core API for this specific golfer.
-            golfer = db.query(Golfer).filter_by(id=pick.golfer_id).first()
-            if golfer:
-                raw = _fetch_golfer_earnings(tournament.pga_tour_id, golfer.pga_tour_id)
+            # Not stored yet — fetch from ESPN core API for this specific pick.
+            # For team events, use the team_competitor_id as the competitor_id;
+            # for individual events, use the golfer's own pga_tour_id.
+            if tournament.is_team_event and entry and entry.team_competitor_id:
+                competitor_id = entry.team_competitor_id
+            else:
+                golfer = db.query(Golfer).filter_by(id=pick.golfer_id).first()
+                competitor_id = golfer.pga_tour_id if golfer else None
+
+            if competitor_id:
+                raw = _fetch_golfer_earnings(
+                    tournament.pga_tour_id,
+                    competitor_id,
+                    competition_id=tournament.competition_id,
+                    is_team_event=tournament.is_team_event,
+                )
                 if raw is not None:
                     earnings = float(raw)
                     # Persist so future calls skip the API hit.
@@ -470,22 +679,33 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
     """
     Sync the field and results for a single tournament using the ESPN core API.
 
-    Fetches all competitors concurrently (golfer names + earnings), upserts
-    golfers and tournament entries, then scores picks if the tournament is
-    completed. Returns a summary dict with counts.
+    Routes to _fetch_team_field for team-format tournaments (is_team_event=True)
+    or _fetch_tournament_data for standard individual tournaments. After upserting
+    golfers and entries, scores any pending picks if the tournament is completed.
+
+    Returns a summary dict with counts.
     """
     tournament = db.query(Tournament).filter_by(pga_tour_id=pga_tour_id).first()
     if not tournament:
         raise ValueError(f"Tournament with pga_tour_id '{pga_tour_id}' not found in DB. "
                          "Run sync_schedule first.")
 
-    log.info("Syncing tournament '%s' (id=%s)", tournament.name, pga_tour_id)
+    log.info("Syncing tournament '%s' (id=%s, team=%s)", tournament.name, pga_tour_id, tournament.is_team_event)
 
-    # Pass IDs of golfers already in DB so _fetch_tournament_data skips re-fetching them.
+    # Pass IDs of golfers already in DB so fetch functions skip re-fetching them.
     known_ids = {g.pga_tour_id for g in db.query(Golfer).all()}
 
     try:
-        golfers, results = _fetch_tournament_data(pga_tour_id, known_golfer_ids=known_ids)
+        if tournament.is_team_event:
+            # Use the stored competition_id (may differ from pga_tour_id for team events).
+            effective_competition_id = tournament.competition_id or pga_tour_id
+            golfers, results = _fetch_team_field(
+                pga_tour_id,
+                effective_competition_id,
+                known_golfer_ids=known_ids,
+            )
+        else:
+            golfers, results = _fetch_tournament_data(pga_tour_id, known_golfer_ids=known_ids)
     except (httpx.HTTPError, httpx.RequestError) as exc:
         log.error("Failed to fetch field for %s: %s", pga_tour_id, exc)
         raise

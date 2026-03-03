@@ -1,11 +1,11 @@
 """
-Picks router — /leagues/{slug}/picks/*
+Picks router — /leagues/{league_id}/picks/*
 
 Endpoints:
-  POST  /leagues/{slug}/picks                Submit a pick for the active season
-  GET   /leagues/{slug}/picks/mine           My picks for the active season
-  GET   /leagues/{slug}/picks                All picks (completed tournaments only)
-  PATCH /leagues/{slug}/picks/{pick_id}      Change the golfer on an existing pick
+  POST  /leagues/{league_id}/picks                Submit a pick for the active season
+  GET   /leagues/{league_id}/picks/mine           My picks for the active season
+  GET   /leagues/{league_id}/picks                All picks (completed tournaments only)
+  PATCH /leagues/{league_id}/picks/{pick_id}      Change the golfer on an existing pick
 """
 
 import uuid
@@ -23,7 +23,7 @@ from app.models import League, LeagueMember, Pick, Season, TournamentStatus, Use
 from app.schemas.pick import PickCreate, PickOut, PickUpdate
 from app.services.picks import validate_new_pick, validate_pick_change
 
-router = APIRouter(prefix="/leagues/{slug}/picks", tags=["picks"])
+router = APIRouter(prefix="/leagues/{league_id}/picks", tags=["picks"])
 
 
 def _picks_with_relations(query):
