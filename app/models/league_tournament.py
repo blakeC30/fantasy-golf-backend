@@ -11,7 +11,7 @@ Picks and standings are scoped to a league's selected tournaments only.
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,6 +35,9 @@ class LeagueTournament(Base):
         ForeignKey("tournaments.id", ondelete="CASCADE"),
         nullable=False,
     )
+
+    # Per-league multiplier override. NULL = inherit from tournament.multiplier.
+    multiplier: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

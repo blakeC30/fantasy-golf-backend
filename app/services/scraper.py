@@ -55,7 +55,7 @@ from datetime import date, datetime, timedelta
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models import Golfer, Pick, Tournament, TournamentEntry, TournamentStatus
+from app.models import Golfer, LeagueTournament, Pick, Tournament, TournamentEntry, TournamentStatus
 
 log = logging.getLogger(__name__)
 
@@ -644,7 +644,15 @@ def score_picks(db: Session, tournament: Tournament) -> int:
                     if entry:
                         entry.earnings_usd = raw
 
-        pick.points_earned = (earnings or 0.0) * tournament.multiplier
+        # Use the league's per-tournament multiplier override if set; otherwise
+        # fall back to the tournament's global multiplier.
+        lt = db.query(LeagueTournament).filter_by(
+            league_id=pick.league_id, tournament_id=tournament.id
+        ).first()
+        effective_multiplier = (
+            lt.multiplier if lt and lt.multiplier is not None else tournament.multiplier
+        )
+        pick.points_earned = (earnings or 0.0) * effective_multiplier
         count += 1
 
     db.commit()
@@ -691,6 +699,16 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
                          "Run sync_schedule first.")
 
     log.info("Syncing tournament '%s' (id=%s, team=%s)", tournament.name, pga_tour_id, tournament.is_team_event)
+
+    # Fetch purse from the core event endpoint (site API scoreboard doesn't include it).
+    try:
+        event_data = _get_json(f"{_CORE_API_BASE}/events/{pga_tour_id}")
+        raw_purse = event_data.get("purse")
+        if raw_purse is not None:
+            tournament.purse_usd = int(raw_purse)
+            db.commit()
+    except Exception as exc:
+        log.warning("Could not fetch purse for %s: %s", pga_tour_id, exc)
 
     # Pass IDs of golfers already in DB so fetch functions skip re-fetching them.
     known_ids = {g.pga_tour_id for g in db.query(Golfer).all()}

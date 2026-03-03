@@ -35,7 +35,7 @@ from app.models import (
     User,
 )
 from app.schemas.league import LeagueCreate, LeagueMemberOut, LeagueOut, LeagueUpdate, LeagueJoinPreview, LeagueRequestOut, RoleUpdate
-from app.schemas.tournament import TournamentOut
+from app.schemas.tournament import LeagueTournamentOut, TournamentOut
 
 router = APIRouter(prefix="/leagues", tags=["leagues"])
 
@@ -386,15 +386,34 @@ def deny_join_request(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{league_id}/tournaments", response_model=list[TournamentOut])
+def _build_league_tournament_out(row: LeagueTournament) -> LeagueTournamentOut:
+    """Build a LeagueTournamentOut from a LeagueTournament row, resolving effective_multiplier."""
+    t = row.tournament
+    effective = row.multiplier if row.multiplier is not None else t.multiplier
+    return LeagueTournamentOut(
+        id=t.id,
+        pga_tour_id=t.pga_tour_id,
+        name=t.name,
+        start_date=t.start_date,
+        end_date=t.end_date,
+        multiplier=t.multiplier,
+        purse_usd=t.purse_usd,
+        status=t.status,
+        is_team_event=t.is_team_event,
+        effective_multiplier=effective,
+    )
+
+
+@router.get("/{league_id}/tournaments", response_model=list[LeagueTournamentOut])
 def get_league_tournaments(
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
     db: Session = Depends(get_db),
 ):
     """
     Return the tournaments selected for this league's schedule, sorted by
-    start_date ascending. Returns [] if the admin hasn't configured the
-    schedule yet.
+    start_date ascending. Each tournament includes effective_multiplier, which
+    resolves to the league's per-tournament override or the global default.
+    Returns [] if the admin hasn't configured the schedule yet.
     """
     league, _ = league_and_member
     rows = (
@@ -404,14 +423,19 @@ def get_league_tournaments(
         .order_by(Tournament.start_date.asc())
         .all()
     )
-    return [row.tournament for row in rows]
+    return [_build_league_tournament_out(row) for row in rows]
+
+
+class TournamentScheduleItem(BaseModel):
+    tournament_id: uuid.UUID
+    multiplier: float | None = None  # None = inherit from tournament.multiplier
 
 
 class TournamentScheduleUpdate(BaseModel):
-    tournament_ids: list[uuid.UUID]
+    tournaments: list[TournamentScheduleItem]
 
 
-@router.put("/{league_id}/tournaments", response_model=list[TournamentOut])
+@router.put("/{league_id}/tournaments", response_model=list[LeagueTournamentOut])
 def update_league_tournaments(
     body: TournamentScheduleUpdate,
     league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
@@ -420,24 +444,30 @@ def update_league_tournaments(
     """
     Atomically replace the league's tournament schedule.
 
-    Sends the full desired selection — existing rows not in the new list are
-    deleted, new IDs are inserted. Returns the updated sorted schedule.
+    Accepts a full list of {tournament_id, multiplier} objects. Multiplier
+    may be null to inherit the tournament's global default. Existing rows not
+    in the new list are deleted; new rows are inserted. Returns the updated
+    sorted schedule.
     Requires league manager.
     """
     league, _ = league_and_manager
 
+    tournament_ids = [item.tournament_id for item in body.tournaments]
+
     # Verify all requested tournament IDs actually exist.
-    if body.tournament_ids:
-        found = db.query(Tournament).filter(
-            Tournament.id.in_(body.tournament_ids)
-        ).count()
-        if found != len(body.tournament_ids):
+    if tournament_ids:
+        found = db.query(Tournament).filter(Tournament.id.in_(tournament_ids)).count()
+        if found != len(tournament_ids):
             raise HTTPException(status_code=422, detail="One or more tournament IDs not found")
 
     # Atomic replace: delete all existing selections, insert new ones.
     db.query(LeagueTournament).filter_by(league_id=league.id).delete()
-    for t_id in body.tournament_ids:
-        db.add(LeagueTournament(league_id=league.id, tournament_id=t_id))
+    for item in body.tournaments:
+        db.add(LeagueTournament(
+            league_id=league.id,
+            tournament_id=item.tournament_id,
+            multiplier=item.multiplier,
+        ))
     db.commit()
 
     rows = (
@@ -447,4 +477,4 @@ def update_league_tournaments(
         .order_by(Tournament.start_date.asc())
         .all()
     )
-    return [row.tournament for row in rows]
+    return [_build_league_tournament_out(row) for row in rows]
