@@ -2,17 +2,20 @@
 Leagues router — /leagues/*
 
 Endpoints:
-  POST  /leagues                                          Create a new league
-  POST  /leagues/join/{invite_code}                       Submit a join request via invite link
-  GET   /leagues/{league_id}                              Get league details (members only)
-  GET   /leagues/{league_id}/members                      List approved members
-  PATCH /leagues/{league_id}/members/{user_id}/role       Change a member's role (manager only)
-  DELETE /leagues/{league_id}/members/{user_id}           Remove a member (manager only)
-  GET   /leagues/{league_id}/requests                     List pending join requests (manager only)
-  POST  /leagues/{league_id}/requests/{user_id}/approve   Approve a join request (manager only)
-  DELETE /leagues/{league_id}/requests/{user_id}          Deny/delete a join request (manager only)
-  GET   /leagues/{league_id}/tournaments                  List league's selected tournaments
-  PUT   /leagues/{league_id}/tournaments                  Replace league's tournament schedule (manager only)
+  POST   /leagues                                          Create a new league
+  POST   /leagues/join/{invite_code}                       Submit a join request via invite link
+  GET    /leagues/{league_id}                              Get league details (members only)
+  PATCH  /leagues/{league_id}                              Update league settings (manager only)
+  DELETE /leagues/{league_id}                              Delete a league and all its data (manager only)
+  GET    /leagues/{league_id}/members                      List approved members
+  PATCH  /leagues/{league_id}/members/{user_id}/role       Change a member's role (manager only)
+  DELETE /leagues/{league_id}/members/me                   Leave a league (any approved member)
+  DELETE /leagues/{league_id}/members/{user_id}            Remove a member (manager only)
+  GET    /leagues/{league_id}/requests                     List pending join requests (manager only)
+  POST   /leagues/{league_id}/requests/{user_id}/approve   Approve a join request (manager only)
+  DELETE /leagues/{league_id}/requests/{user_id}           Deny/delete a join request (manager only)
+  GET    /leagues/{league_id}/tournaments                  List league's selected tournaments
+  PUT    /leagues/{league_id}/tournaments                  Replace league's tournament schedule (manager only)
 """
 
 import datetime
@@ -30,6 +33,7 @@ from app.models import (
     LeagueMemberRole,
     LeagueMemberStatus,
     LeagueTournament,
+    Pick,
     Season,
     Tournament,
     User,
@@ -230,6 +234,28 @@ def update_league(
     return league
 
 
+@router.delete("/{league_id}", status_code=204)
+def delete_league(
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently delete a league and all associated data (picks, seasons,
+    members, tournament schedule). Requires league manager. Cannot be undone.
+
+    Deletes in FK-safe order because the DB constraints don't have ON DELETE CASCADE:
+    picks → seasons → league_members → league_tournaments → league.
+    """
+    league, _ = league_and_manager
+
+    db.query(Pick).filter_by(league_id=league.id).delete()
+    db.query(Season).filter_by(league_id=league.id).delete()
+    db.query(LeagueMember).filter_by(league_id=league.id).delete()
+    db.query(LeagueTournament).filter_by(league_id=league.id).delete()
+    db.delete(league)
+    db.commit()
+
+
 @router.get("/{league_id}/members", response_model=list[LeagueMemberOut])
 def list_members(
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
@@ -271,6 +297,17 @@ def update_member_role(
     db.commit()
     db.refresh(membership)
     return membership
+
+
+@router.delete("/{league_id}/members/me", status_code=204)
+def leave_league(
+    league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
+    db: Session = Depends(get_db),
+):
+    """Allow any approved member to leave a league voluntarily."""
+    _, membership = league_and_member
+    db.delete(membership)
+    db.commit()
 
 
 @router.delete("/{league_id}/members/{user_id}", status_code=204)
