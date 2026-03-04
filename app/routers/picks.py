@@ -7,6 +7,7 @@ Endpoints:
   GET   /leagues/{league_id}/picks                          All picks (completed tournaments only)
   GET   /leagues/{league_id}/picks/tournament/{t_id}        Pick breakdown for one tournament
   PATCH /leagues/{league_id}/picks/{pick_id}                Change the golfer on an existing pick
+  PUT   /leagues/{league_id}/picks/admin-override           Manager: upsert or delete any member's pick
 """
 
 import uuid
@@ -20,6 +21,7 @@ from app.database import get_db
 from app.dependencies import (
     get_active_season,
     get_current_user,
+    require_league_manager,
     require_league_member,
 )
 from app.models import (
@@ -30,12 +32,14 @@ from app.models import (
     LeagueTournament,
     Pick,
     Season,
+    Tournament,
     TournamentEntry,
     TournamentStatus,
     User,
 )
 from app.schemas.pick import PickCreate, PickOut, PickUpdate
 from app.services.picks import validate_new_pick, validate_pick_change
+from app.services.scraper import score_picks
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +57,7 @@ class GolferPickGroup(BaseModel):
     golfer_name: str
     pick_count: int
     pickers: list[PickerInfo]
+    earnings_usd: float | None  # raw golfer earnings before multiplier
 
 
 class NoPicker(BaseModel):
@@ -76,10 +81,11 @@ router = APIRouter(prefix="/leagues/{league_id}/picks", tags=["picks"])
 
 
 def _picks_with_relations(query):
-    """Eagerly load golfer and tournament so they're available for the schema."""
+    """Eagerly load golfer, tournament, and entry so they're available for the schema."""
     return query.options(
         joinedload(Pick.golfer),
         joinedload(Pick.tournament),
+        joinedload(Pick.entry),
     )
 
 
@@ -203,7 +209,7 @@ def get_tournament_picks_summary(
     picks = (
         db.query(Pick)
         .filter_by(league_id=league.id, tournament_id=tournament_id)
-        .options(joinedload(Pick.golfer), joinedload(Pick.user))
+        .options(joinedload(Pick.golfer), joinedload(Pick.user), joinedload(Pick.entry))
         .all()
     )
 
@@ -215,7 +221,7 @@ def get_tournament_picks_summary(
     )
 
     golfer_map: dict[str, dict] = defaultdict(
-        lambda: {"golfer_id": None, "golfer_name": None, "pickers": []}
+        lambda: {"golfer_id": None, "golfer_name": None, "pickers": [], "earnings_usd": None}
     )
     picker_ids: set[uuid.UUID] = set()
 
@@ -223,6 +229,7 @@ def get_tournament_picks_summary(
         gid = str(pick.golfer_id)
         golfer_map[gid]["golfer_id"] = gid
         golfer_map[gid]["golfer_name"] = pick.golfer.name
+        golfer_map[gid]["earnings_usd"] = pick.earnings_usd  # same for all pickers of this golfer
         golfer_map[gid]["pickers"].append(
             PickerInfo(
                 user_id=str(pick.user_id),
@@ -239,6 +246,7 @@ def get_tournament_picks_summary(
                 golfer_name=v["golfer_name"],
                 pick_count=len(v["pickers"]),
                 pickers=v["pickers"],
+                earnings_usd=v["earnings_usd"],
             )
             for v in golfer_map.values()
         ],
@@ -321,5 +329,97 @@ def change_pick(
     return (
         _picks_with_relations(db.query(Pick))
         .filter_by(id=pick.id)
+        .first()
+    )
+
+
+class AdminPickOverride(BaseModel):
+    user_id: uuid.UUID
+    tournament_id: uuid.UUID
+    golfer_id: uuid.UUID | None  # None = remove the pick
+
+
+@router.put("/admin-override", response_model=PickOut | None)
+def admin_override_pick(
+    body: AdminPickOverride,
+    league_and_manager: tuple[League, LeagueMember] = Depends(require_league_manager),
+    season: Season = Depends(get_active_season),
+    db: Session = Depends(get_db),
+):
+    """
+    Manager-only: create, replace, or delete any league member's pick.
+
+    - golfer_id provided → upsert the pick (create or replace existing)
+    - golfer_id null     → delete the pick if it exists
+
+    No deadline or no-repeat validation is applied — this is a commissioner
+    override and intentionally bypasses the normal pick rules.
+    """
+    league, _ = league_and_manager
+
+    # Verify the target user is an approved member of this league
+    membership = (
+        db.query(LeagueMember)
+        .filter_by(league_id=league.id, user_id=body.user_id, status=LeagueMemberStatus.APPROVED.value)
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=404, detail="User is not an approved league member")
+
+    # Find existing pick for this user + tournament in the active season
+    existing = (
+        db.query(Pick)
+        .filter_by(
+            league_id=league.id,
+            season_id=season.id,
+            user_id=body.user_id,
+            tournament_id=body.tournament_id,
+        )
+        .first()
+    )
+
+    if body.golfer_id is None:
+        # Remove pick
+        if existing:
+            db.delete(existing)
+            db.commit()
+        return None
+
+    # Verify golfer is in the tournament field
+    entry = (
+        db.query(TournamentEntry)
+        .filter_by(tournament_id=body.tournament_id, golfer_id=body.golfer_id)
+        .first()
+    )
+    if not entry:
+        raise HTTPException(status_code=422, detail="Golfer is not in the tournament field")
+
+    tournament = db.query(Tournament).filter_by(id=body.tournament_id).first()
+
+    if existing:
+        existing.golfer_id = body.golfer_id
+        existing.points_earned = None  # reset so score_picks recalculates
+        db.commit()
+        pick_id = existing.id
+    else:
+        pick = Pick(
+            league_id=league.id,
+            season_id=season.id,
+            user_id=body.user_id,
+            tournament_id=body.tournament_id,
+            golfer_id=body.golfer_id,
+        )
+        db.add(pick)
+        db.commit()
+        pick_id = pick.id
+
+    # If the tournament is already completed, score the pick immediately
+    # so points_earned is populated without waiting for the next scheduled sync.
+    if tournament and tournament.status == TournamentStatus.COMPLETED.value:
+        score_picks(db, tournament)
+
+    return (
+        _picks_with_relations(db.query(Pick))
+        .filter_by(id=pick_id)
         .first()
     )

@@ -18,11 +18,16 @@ Business rules enforced here (via UniqueConstraint) and in the API layer:
 import uuid
 from datetime import datetime
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import DateTime, Float, ForeignKey, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
+
+if TYPE_CHECKING:
+    from app.models.tournament import TournamentEntry
 
 
 class Pick(Base):
@@ -76,6 +81,26 @@ class Pick(Base):
     user: Mapped["User"] = relationship(back_populates="picks")
     tournament: Mapped["Tournament"] = relationship(back_populates="picks")
     golfer: Mapped["Golfer"] = relationship(back_populates="picks")
+
+    # Viewonly join to TournamentEntry so the API can expose raw earnings_usd
+    # alongside points_earned (which bakes in the multiplier at scoring time).
+    entry: Mapped["TournamentEntry | None"] = relationship(
+        "TournamentEntry",
+        primaryjoin=(
+            "and_(Pick.tournament_id == TournamentEntry.tournament_id, "
+            "Pick.golfer_id == TournamentEntry.golfer_id)"
+        ),
+        foreign_keys="[TournamentEntry.tournament_id, TournamentEntry.golfer_id]",
+        viewonly=True,
+        uselist=False,
+    )
+
+    @property
+    def earnings_usd(self) -> float | None:
+        """Raw golfer earnings before the league multiplier is applied."""
+        if self.entry is not None and self.entry.earnings_usd is not None:
+            return float(self.entry.earnings_usd)
+        return None
 
     def __repr__(self) -> str:
         return (

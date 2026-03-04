@@ -40,6 +40,8 @@ from app.models import (
 )
 from app.schemas.league import LeagueCreate, LeagueMemberOut, LeagueOut, LeagueUpdate, LeagueJoinPreview, LeagueRequestOut, RoleUpdate
 from app.schemas.tournament import LeagueTournamentOut, TournamentOut
+from app.models.tournament import TournamentStatus
+from app.services.scraper import score_picks
 
 router = APIRouter(prefix="/leagues", tags=["leagues"])
 
@@ -506,6 +508,15 @@ def update_league_tournaments(
             multiplier=item.multiplier,
         ))
     db.commit()
+
+    # Re-score picks for every completed tournament in the new schedule.
+    # Always re-score (not just on multiplier change) so stale points_earned
+    # values from before multipliers were set get corrected automatically.
+    # score_picks uses cached TournamentEntry.earnings_usd — no ESPN API calls.
+    for item in body.tournaments:
+        tournament = db.query(Tournament).filter_by(id=item.tournament_id).first()
+        if tournament and tournament.status == TournamentStatus.COMPLETED.value:
+            score_picks(db, tournament)
 
     rows = (
         db.query(LeagueTournament)

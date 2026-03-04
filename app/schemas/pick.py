@@ -21,9 +21,11 @@ class PickUpdate(BaseModel):
 
 class PickOut(BaseModel):
     id: uuid.UUID
+    user_id: uuid.UUID
     tournament_id: uuid.UUID
     golfer_id: uuid.UUID
     points_earned: float | None
+    earnings_usd: float | None  # raw golfer earnings before multiplier
     submitted_at: datetime
     golfer: GolferOut
     tournament: TournamentOut
