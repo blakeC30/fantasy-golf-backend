@@ -30,6 +30,7 @@ from app.models import (
     LeagueTournament,
     Pick,
     Season,
+    TournamentEntry,
     TournamentStatus,
     User,
 )
@@ -59,11 +60,17 @@ class NoPicker(BaseModel):
     display_name: str
 
 
+class WinnerInfo(BaseModel):
+    golfer_name: str
+    pick_count: int  # 0 if no league member picked the winner
+
+
 class TournamentPicksSummary(BaseModel):
     tournament_status: str
     member_count: int
     picks_by_golfer: list[GolferPickGroup]   # sorted by pick_count desc
     no_pick_members: list[NoPicker]
+    winner: WinnerInfo | None  # None for non-completed tournaments
 
 router = APIRouter(prefix="/leagues/{league_id}/picks", tags=["picks"])
 
@@ -244,11 +251,31 @@ def get_tournament_picks_summary(
         if m.user_id not in picker_ids
     ]
 
+    # For completed tournaments, find the actual winner (finish_position=1)
+    winner: WinnerInfo | None = None
+    if tournament.status == TournamentStatus.COMPLETED.value:
+        top_entry = (
+            db.query(TournamentEntry)
+            .filter_by(tournament_id=tournament_id, finish_position=1)
+            .options(joinedload(TournamentEntry.golfer))
+            .first()
+        )
+        if top_entry:
+            pick_count = sum(
+                1 for g in picks_by_golfer
+                if g.golfer_id == str(top_entry.golfer_id)
+            )
+            winner = WinnerInfo(
+                golfer_name=top_entry.golfer.name,
+                pick_count=pick_count,
+            )
+
     return TournamentPicksSummary(
         tournament_status=tournament.status,
         member_count=len(members),
         picks_by_golfer=picks_by_golfer,
         no_pick_members=no_pick_members,
+        winner=winner,
     )
 
 
