@@ -103,5 +103,5 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
             }
         )
 
-    standings.sort(key=lambda x: x["total_points"], reverse=True)
+    standings.sort(key=lambda x: (-x["total_points"], x["display_name"]))
     return standings
