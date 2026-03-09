@@ -74,7 +74,13 @@ def get_tournament_field(
 
     Used by the pick form to show which golfers are available to pick.
     Sorted by world_ranking (ascending — lower rank = better player).
+
+    When the tournament is IN_PROGRESS, only golfers who haven't teed off yet
+    are returned (tee_time in the future and not withdrawn). This prevents the
+    pick form from showing ineligible golfers.
     """
+    from datetime import datetime, timezone
+
     tournament = db.query(Tournament).filter_by(id=tournament_id).first()
     if not tournament:
         raise HTTPException(status_code=404, detail="Tournament not found")
@@ -87,4 +93,14 @@ def get_tournament_field(
         .order_by(Golfer.world_ranking.asc().nulls_last())
         .all()
     )
+
+    if tournament.status == TournamentStatus.IN_PROGRESS.value:
+        now = datetime.now(timezone.utc)
+        entries = [
+            e for e in entries
+            if e.tee_time is not None
+            and e.tee_time > now
+            and e.status != "WD"
+        ]
+
     return [e.golfer for e in entries]

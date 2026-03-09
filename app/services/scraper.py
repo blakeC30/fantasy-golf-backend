@@ -35,6 +35,11 @@ ESPN API endpoints used
              /events/{id}/competitions/{competition_id}/competitors/{competitor_id}/statistics
                → earnings for completed tournaments; team events use 'officialAmount'
                stat (divided by 2 for per-golfer share); individual events use 'amount'
+             /events/{id}/competitions/{competition_id}/competitors/{competitor_id}/linescores
+               → per-round data for each golfer: tee time, strokes, score-to-par,
+               leaderboard position, and playoff flag. One call returns ALL rounds
+               played so far, replacing the older /status endpoint (which only
+               returned the current round's tee time). Stored in tournament_entry_rounds.
              /athletes/{athlete_id}
                → golfer name and country
 
@@ -43,6 +48,25 @@ ESPN API endpoints used
   exposed in the scoreboard as competitions[0].id. The scraper stores this
   in Tournament.competition_id so subsequent calls use the correct ID.
 
+Per-round data notes
+--------------------
+  The /linescores endpoint returns a paginated list of round objects for a
+  competitor. Each item includes:
+    period         → round number (1–4 regular, 5+ playoff)
+    teeTime        → ISO 8601 UTC string for that round's start time
+    value          → total strokes for the round (float, cast to int)
+    displayValue   → score-to-par as string ("-2", "E", "+1") — parsed to int
+    currentPosition→ leaderboard rank after this round (integer, stored as string)
+    isPlayoff      → true for playoff rounds
+
+  Tee times are only released Tuesday or Wednesday before the Thursday start.
+  When linescores are empty or teeTime is absent, we store None and leave
+  picks unlocked.
+
+  tournament_entries.tee_time always holds Round 1's tee time and is never
+  overwritten by later rounds. Pick-locking logic reads this field: once Round 1
+  has started (tee_time <= now), the pick is locked for the entire tournament.
+
 Note: The older summary endpoint (site.api.espn.com/...pga/summary?event=)
 is no longer functional — it returns ESPN error code 2500 for all event IDs.
 The core API endpoints above are the reliable replacement.
@@ -50,12 +74,12 @@ The core API endpoints above are the reliable replacement.
 
 import concurrent.futures
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models import Golfer, LeagueTournament, Pick, Tournament, TournamentEntry, TournamentStatus
+from app.models import Golfer, LeagueTournament, Pick, Tournament, TournamentEntry, TournamentEntryRound, TournamentStatus
 
 log = logging.getLogger(__name__)
 
@@ -108,9 +132,145 @@ def _fetch_athlete_info(athlete_id: str) -> dict:
     return {"pga_tour_id": str(athlete_id), "name": "Unknown", "country": None}
 
 
+def _parse_score_to_par(display_value: str | None) -> int | None:
+    """
+    Convert ESPN's score-to-par display string to an integer.
+
+    ESPN "displayValue" examples:
+      "-2"  → -2   (under par)
+      "E"   →  0   (even par)
+      "+1"  → +1   (over par)
+      "1"   →  1   (over par, no leading "+")
+
+    Returns None if the value is absent or unparseable.
+    """
+    if not display_value:
+        return None
+    v = display_value.strip()
+    if v.upper() == "E":
+        return 0
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _fetch_competitor_rounds(
+    pga_tour_id: str,
+    competition_id: str,
+    athlete_id: str,
+) -> tuple[str, list[dict]]:
+    """
+    Fetch all per-round data for one competitor from the ESPN /linescores endpoint.
+
+    ESPN linescores endpoint
+    ------------------------
+    URL:    /events/{pga_tour_id}/competitions/{competition_id}/competitors/{athlete_id}/linescores
+    Returns a paginated list of round objects (one per round played).
+
+    Per-round fields used
+    ---------------------
+    period         → round_number  (int, 1–4 standard, 5+ playoff)
+    teeTime        → tee_time      (ISO 8601 UTC string, nullable)
+    value          → score         (total strokes as float, cast to int, nullable)
+    displayValue   → score_to_par  (string like "-2"/"E"/"+1", parsed to int, nullable)
+    currentPosition→ position      (int rank after this round, stored as string, nullable)
+    isPlayoff      → is_playoff    (bool, default False)
+
+    The linescores array nested inside each round item contains hole-by-hole
+    data (18 items per round). We do NOT store that level of detail — only the
+    round summary fields listed above.
+
+    This single endpoint call replaces the old /status endpoint call, which only
+    returned the CURRENT round's tee time. The /linescores endpoint returns ALL
+    rounds, giving us historical round data for display.
+
+    Side-effect on tournament_entries.tee_time:
+    The caller (upsert_field) reads the latest round's tee_time from the returned
+    dicts and writes it back to tournament_entries.tee_time for pick-locking.
+
+    Returns:
+      (athlete_id, rounds) where rounds is a list of dicts ready to upsert into
+      tournament_entry_rounds. An empty list means no linescores data available.
+    """
+    url = (
+        f"{_CORE_API_BASE}/events/{pga_tour_id}"
+        f"/competitions/{competition_id}/competitors/{athlete_id}/linescores"
+    )
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return athlete_id, []
+            data = resp.json()
+    except httpx.RequestError as exc:
+        log.warning("Could not fetch linescores for athlete %s: %s", athlete_id, exc)
+        return athlete_id, []
+
+    rounds: list[dict] = []
+    for item in data.get("items", []):
+        # ESPN "period" is the round number. Skip items without a valid period.
+        raw_period = item.get("period")
+        if raw_period is None:
+            continue
+        try:
+            round_number = int(raw_period)
+        except (ValueError, TypeError):
+            log.warning(
+                "Unexpected period value for athlete %s: %r — skipping round",
+                athlete_id, raw_period,
+            )
+            continue
+
+        # Parse tee_time from ISO 8601 UTC string (e.g. "2026-03-05T13:45Z").
+        tee_time_utc: datetime | None = None
+        raw_tee_time = item.get("teeTime")
+        if raw_tee_time:
+            try:
+                dt = datetime.fromisoformat(raw_tee_time.replace("Z", "+00:00"))
+                tee_time_utc = dt.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                log.warning(
+                    "Could not parse teeTime %r for athlete %s round %d",
+                    raw_tee_time, athlete_id, round_number,
+                )
+
+        # ESPN "value" is strokes as a float (e.g. 70.0); cast to int.
+        raw_value = item.get("value")
+        score: int | None = None
+        if raw_value is not None:
+            try:
+                score = int(float(raw_value))
+            except (ValueError, TypeError):
+                pass
+
+        # ESPN "displayValue": score-to-par string for this round ("-2", "E", "+1").
+        score_to_par = _parse_score_to_par(item.get("displayValue"))
+
+        # ESPN "currentPosition": leaderboard rank after this round (integer).
+        # Stored as a string to accommodate future positional formats (e.g. "T5").
+        raw_pos = item.get("currentPosition")
+        position: str | None = str(raw_pos) if raw_pos is not None else None
+
+        # ESPN "isPlayoff": true only for playoff rounds.
+        is_playoff = bool(item.get("isPlayoff", False))
+
+        rounds.append({
+            "round_number": round_number,
+            "tee_time": tee_time_utc,
+            "score": score,
+            "score_to_par": score_to_par,
+            "position": position,
+            "is_playoff": is_playoff,
+        })
+
+    return athlete_id, rounds
+
+
 def _fetch_tournament_data(
     pga_tour_id: str,
     known_golfer_ids: set[str] | None = None,
+    fetch_round_data: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """
     Fetch the golfer field and finish order for one individual (non-team) tournament.
@@ -123,14 +283,26 @@ def _fetch_tournament_data(
     Earnings are left as None — fetched on-demand in score_picks() for only
     the golfers users actually picked (1 API call per pick, not per field).
 
+    When fetch_round_data=True, also fetches per-round data for each golfer
+    from the /competitors/{id}/linescores endpoint concurrently. This returns
+    all rounds played (tee time, strokes, score-to-par, position per round)
+    and replaces the older /status-only tee time fetch. Enabled for both
+    SCHEDULED (pre-tournament tee times) and IN_PROGRESS / COMPLETED tournaments
+    (live and historical round scores).
+
     Args:
       pga_tour_id:       ESPN event ID for the tournament (also the competition ID
                          for individual tournaments).
       known_golfer_ids:  pga_tour_ids already in the DB; skips re-fetching them.
+      fetch_round_data:  If True, fetch per-round linescores from the /linescores
+                         sub-endpoint for every competitor. Adds ~N concurrent HTTP
+                         calls where N is field size (~72-156). Defaults to False.
 
     Returns:
       golfers  — list of dicts ready to upsert as Golfer rows
-      results  — list of dicts ready to upsert as TournamentEntry rows
+      results  — list of dicts ready to upsert as TournamentEntry rows; each dict
+                 includes a "rounds" key with a list of per-round dicts (may be
+                 empty if fetch_round_data=False or no linescores available).
     """
     # Step 1: one request for the full competitor list (IDs + finish order).
     competitors_url = (
@@ -144,11 +316,9 @@ def _fetch_tournament_data(
         log.warning("No competitors found for tournament %s", pga_tour_id)
         return [], []
 
+    all_athlete_ids = [str(c["id"]) for c in competitors if c.get("id")]
     known = known_golfer_ids or set()
-    ids_to_fetch = [
-        str(c["id"]) for c in competitors
-        if c.get("id") and str(c["id"]) not in known
-    ]
+    ids_to_fetch = [aid for aid in all_athlete_ids if aid not in known]
 
     # Step 2: fetch athlete info only for golfers not already in DB.
     athlete_info: dict[str, dict] = {}
@@ -161,6 +331,28 @@ def _fetch_tournament_data(
                     athlete_info[info["pga_tour_id"]] = info
                 except Exception as exc:
                     log.warning("Athlete fetch failed: %s", exc)
+
+    # Step 3 (optional): fetch per-round linescores from the /linescores sub-endpoint.
+    # For individual events competition_id == pga_tour_id.
+    # rounds_by_athlete maps athlete_id → list of round dicts (may be empty).
+    rounds_by_athlete: dict[str, list[dict]] = {}
+    if fetch_round_data and all_athlete_ids:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures_rd = {
+                pool.submit(_fetch_competitor_rounds, pga_tour_id, pga_tour_id, aid): aid
+                for aid in all_athlete_ids
+            }
+            for future in concurrent.futures.as_completed(futures_rd):
+                try:
+                    aid, rounds = future.result()
+                    rounds_by_athlete[aid] = rounds
+                except Exception as exc:
+                    log.warning("Round data fetch failed: %s", exc)
+        non_empty = sum(1 for rds in rounds_by_athlete.values() if rds)
+        log.info(
+            "Tournament %s: fetched round data for %d competitors (%d with rounds)",
+            pga_tour_id, len(rounds_by_athlete), non_empty,
+        )
 
     log.info(
         "Tournament %s: %d competitors, %d new athlete fetches",
@@ -182,12 +374,24 @@ def _fetch_tournament_data(
             "name": info["name"] if info else None,
             "country": info["country"] if info else None,
         })
+
+        rounds = rounds_by_athlete.get(athlete_id, []) if fetch_round_data else []
+
+        # Derive tee_time for tournament_entries.tee_time from Round 1 only.
+        # Once Thursday starts, the pick is locked for the whole tournament —
+        # we never overwrite this with a later round's tee time.
+        current_tee_time: datetime | None = next(
+            (rd["tee_time"] for rd in rounds if rd["round_number"] == 1 and rd["tee_time"] is not None),
+            None,
+        )
+
         results.append({
             "pga_tour_id": athlete_id,
             "finish_position": c.get("order"),
             "earnings_usd": None,
             "status": None,
-            "tee_time": None,
+            "tee_time": current_tee_time,
+            "rounds": rounds,
             "team_competitor_id": None,
         })
 
@@ -223,6 +427,7 @@ def _fetch_team_field(
     pga_tour_id: str,
     competition_id: str,
     known_golfer_ids: set[str] | None = None,
+    fetch_round_data: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """
     Fetch the individual golfer field for a team-format tournament.
@@ -233,18 +438,30 @@ def _fetch_team_field(
       2. Expands each team into its two individual athlete IDs via the roster
          sub-endpoint.
       3. Fetches athlete info (name, country) concurrently for new golfers.
-      4. Returns golfers + results lists with team_competitor_id set on each
+      4. Optionally fetches per-round linescores from the /linescores sub-endpoint
+         when fetch_round_data=True (all tournament states — provides tee times
+         for upcoming rounds and scores/positions for completed rounds).
+      5. Returns golfers + results lists with team_competitor_id set on each
          entry so score_picks can use the correct earnings endpoint later.
+
+    Note on team event linescores: the /linescores endpoint uses the individual
+    athlete_id as the competitor key (not the team_id), so the same
+    _fetch_competitor_rounds helper works here. The competition_id used
+    in the URL must be the team event's actual competition_id (may differ
+    from pga_tour_id).
 
     Args:
       pga_tour_id:       ESPN event ID (used in earnings API URL).
       competition_id:    ESPN competition ID (may differ from pga_tour_id for
                          team events — stored in Tournament.competition_id).
       known_golfer_ids:  pga_tour_ids already in the DB; skips re-fetching them.
+      fetch_round_data:  If True, fetch per-round linescores from the /linescores
+                         sub-endpoint for every individual golfer. Defaults to False.
 
     Returns:
       golfers  — list of dicts (one per individual golfer, not per team)
-      results  — list of dicts (one per individual golfer, with team_competitor_id)
+      results  — list of dicts (one per individual golfer, with team_competitor_id
+                 and a "rounds" key with a list of per-round dicts)
     """
     competitors_url = (
         f"{_CORE_API_BASE}/events/{pga_tour_id}"
@@ -284,6 +501,29 @@ def _fetch_team_field(
                 except Exception as exc:
                     log.warning("Athlete fetch failed: %s", exc)
 
+    # Fetch per-round linescores for all individual golfers when requested.
+    # For team events the /linescores URL uses the individual athlete_id, not the team_id.
+    # rounds_by_athlete maps athlete_id → list of per-round dicts.
+    rounds_by_athlete: dict[str, list[dict]] = {}
+    if fetch_round_data and team_entries:
+        all_athlete_ids = [aid for aid, _, _ in team_entries]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures_rd = {
+                pool.submit(_fetch_competitor_rounds, pga_tour_id, competition_id, aid): aid
+                for aid in all_athlete_ids
+            }
+            for future in concurrent.futures.as_completed(futures_rd):
+                try:
+                    aid, rounds = future.result()
+                    rounds_by_athlete[aid] = rounds
+                except Exception as exc:
+                    log.warning("Round data fetch failed: %s", exc)
+        non_empty = sum(1 for rds in rounds_by_athlete.values() if rds)
+        log.info(
+            "Team tournament %s: fetched round data for %d golfers (%d with rounds)",
+            pga_tour_id, len(rounds_by_athlete), non_empty,
+        )
+
     log.info(
         "Team tournament %s: %d teams → %d individual golfers, %d new athlete fetches",
         pga_tour_id, len(team_competitors), len(team_entries), len(ids_to_fetch),
@@ -298,12 +538,24 @@ def _fetch_team_field(
             "name": info["name"] if info else None,
             "country": info["country"] if info else None,
         })
+
+        rounds = rounds_by_athlete.get(athlete_id, []) if fetch_round_data else []
+
+        # Derive tee_time for tournament_entries.tee_time from Round 1 only.
+        # Once Thursday starts, the pick is locked for the whole tournament —
+        # we never overwrite this with a later round's tee time.
+        current_tee_time: datetime | None = next(
+            (rd["tee_time"] for rd in rounds if rd["round_number"] == 1 and rd["tee_time"] is not None),
+            None,
+        )
+
         results.append({
             "pga_tour_id": athlete_id,
             "finish_position": finish_order,
             "earnings_usd": None,
             "status": None,
-            "tee_time": None,
+            "tee_time": current_tee_time,
+            "rounds": rounds,
             "team_competitor_id": team_id,
         })
 
@@ -577,6 +829,40 @@ def upsert_field(
             db.add(entry)
             entries_synced += 1
 
+        # Upsert per-round data into tournament_entry_rounds.
+        # Each round dict came from _fetch_competitor_rounds via the /linescores endpoint.
+        # flush() ensures entry.id is set before we reference it as a FK.
+        rounds = result.get("rounds", [])
+        if rounds:
+            db.flush()  # populate entry.id if this is a new entry
+            for rd in rounds:
+                round_row = db.query(TournamentEntryRound).filter_by(
+                    tournament_entry_id=entry.id,
+                    round_number=rd["round_number"],
+                ).first()
+                if round_row:
+                    # Update all mutable fields — data may change while a tournament
+                    # is in progress (scores finalize, position updates, etc.).
+                    if rd.get("tee_time") is not None:
+                        round_row.tee_time = rd["tee_time"]
+                    if rd.get("score") is not None:
+                        round_row.score = rd["score"]
+                    if rd.get("score_to_par") is not None:
+                        round_row.score_to_par = rd["score_to_par"]
+                    if rd.get("position") is not None:
+                        round_row.position = rd["position"]
+                    round_row.is_playoff = rd.get("is_playoff", False)
+                else:
+                    db.add(TournamentEntryRound(
+                        tournament_entry_id=entry.id,
+                        round_number=rd["round_number"],
+                        tee_time=rd.get("tee_time"),
+                        score=rd.get("score"),
+                        score_to_par=rd.get("score_to_par"),
+                        position=rd.get("position"),
+                        is_playoff=rd.get("is_playoff", False),
+                    ))
+
         golfers_synced += 1
 
     db.commit()
@@ -691,6 +977,11 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
     or _fetch_tournament_data for standard individual tournaments. After upserting
     golfers and entries, scores any pending picks if the tournament is completed.
 
+    Per-round data (tee times, strokes, score-to-par, position) is fetched for
+    all tournament states using the ESPN /linescores endpoint. This single call
+    covers tee times for upcoming rounds (for pick-locking) and historical
+    round scores for completed tournaments.
+
     Returns a summary dict with counts.
     """
     tournament = db.query(Tournament).filter_by(pga_tour_id=pga_tour_id).first()
@@ -713,6 +1004,14 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
     # Pass IDs of golfers already in DB so fetch functions skip re-fetching them.
     known_ids = {g.pga_tour_id for g in db.query(Golfer).all()}
 
+    # Fetch per-round linescores for all tournament states:
+    #   - SCHEDULED: gets tee times for upcoming rounds (pick-locking needs this).
+    #   - IN_PROGRESS: gets live scores + positions for rounds already played.
+    #   - COMPLETED: gets historical round-by-round data for display.
+    # We fetch round data in all cases now because /linescores is the single
+    # endpoint that covers both tee times and scores — no need to special-case.
+    should_fetch_round_data = True
+
     try:
         if tournament.is_team_event:
             # Use the stored competition_id (may differ from pga_tour_id for team events).
@@ -721,9 +1020,14 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
                 pga_tour_id,
                 effective_competition_id,
                 known_golfer_ids=known_ids,
+                fetch_round_data=should_fetch_round_data,
             )
         else:
-            golfers, results = _fetch_tournament_data(pga_tour_id, known_golfer_ids=known_ids)
+            golfers, results = _fetch_tournament_data(
+                pga_tour_id,
+                known_golfer_ids=known_ids,
+                fetch_round_data=should_fetch_round_data,
+            )
     except (httpx.HTTPError, httpx.RequestError) as exc:
         log.error("Failed to fetch field for %s: %s", pga_tour_id, exc)
         raise

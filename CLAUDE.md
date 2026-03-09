@@ -157,6 +157,7 @@ Always call `db.commit()` explicitly. Never rely on auto-commit. Use `db.refresh
 | `seasons` | league_id, year (int), is_active; UNIQUE(league_id, year) |
 | `tournaments` | pga_tour_id (unique), name, start_date, end_date, multiplier (float, default=1.0), status, competition_id (nullable), is_team_event (bool) |
 | `tournament_entries` | tournament_id, golfer_id, tee_time, earnings_usd, finish_position, team_competitor_id (nullable) |
+| `tournament_entry_rounds` | tournament_entry_id (FK→tournament_entries.id), round_number (int), tee_time (UTC, nullable), score (int, nullable), score_to_par (int, nullable), position (str(10), nullable), is_playoff (bool); UNIQUE(tournament_entry_id, round_number) |
 | `golfers` | pga_tour_id (unique), name, world_ranking, country |
 | `picks` | league_id, season_id, user_id, tournament_id, golfer_id, points_earned (nullable); UNIQUE(league_id, season_id, user_id, tournament_id) |
 | `league_tournaments` | league_id, tournament_id, multiplier (float nullable); UNIQUE(league_id, tournament_id) |
@@ -189,6 +190,8 @@ Existing migration files (in order):
 6. `b7d4e1f2a9c3` — add is_team_event, competition_id, team_competitor_id
 7. `c4e8a2f1b9d6` — rename admin role → manager
 8. `d2e5f8a3c1b7` — add `league_tournaments.multiplier` (per-league override)
+9. `e3f7a1c2d9b8` — add `tournament_entry_round_times` table (per-round tee times)
+10. `f1a4b7c9e2d3` — replace `tournament_entry_round_times` with `tournament_entry_rounds` (full per-round data: score, score_to_par, position, tee_time, is_playoff)
 
 New migrations still go in `alembic/versions/` with correct `down_revision` chaining, but are applied manually via psql.
 

@@ -159,10 +159,11 @@ class TournamentEntry(Base):
         UUID(as_uuid=True), ForeignKey("golfers.id"), nullable=False
     )
 
-    # Round-1 tee time for this golfer (timezone-aware).
+    # Round 1 (Thursday) tee time for this golfer (timezone-aware).
     # Null until the official tee sheet is released (usually Tuesday/Wednesday).
-    # The API uses this to lock pick changes: if now() >= tee_time, the pick
-    # is locked and can no longer be changed for that tournament.
+    # Once set, this value is never overwritten by later rounds' tee times.
+    # Pick-locking logic: if now() >= tee_time, the pick is locked for the
+    # entire tournament (not just Round 1 — picking closes when Thursday starts).
     tee_time: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -187,9 +188,80 @@ class TournamentEntry(Base):
     # --- Relationships ---
     tournament: Mapped["Tournament"] = relationship(back_populates="entries")
     golfer: Mapped["Golfer"] = relationship(back_populates="tournament_entries")
+    rounds: Mapped[list["TournamentEntryRound"]] = relationship(
+        back_populates="entry", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return (
             f"<TournamentEntry tournament={self.tournament_id} "
             f"golfer={self.golfer_id} position={self.finish_position}>"
         )
+
+
+class TournamentEntryRound(Base):
+    """
+    Per-round performance data for a golfer in a tournament.
+
+    One row per (tournament_entry, round_number). Populated by the scraper
+    using the ESPN core API /linescores endpoint, which provides full
+    round-by-round breakdowns for completed and in-progress tournaments.
+
+    The existing tournament_entries.tee_time column is unchanged — it holds
+    the current round's tee time used by pick-locking logic. This table
+    stores tee_time per round for historical display (e.g. showing users
+    what time their golfer teed off in each round).
+
+    ESPN field mappings
+    -------------------
+    round_number  ← linescores item "period"           (int, 1–4, 5+ playoff)
+    tee_time      ← linescores item "teeTime"          (ISO 8601 UTC, nullable)
+    score         ← linescores item "value"            (total strokes, nullable)
+    score_to_par  ← linescores item "displayValue"     (string parsed to int:
+                                                         "-2"→-2, "E"→0, "+1"→1)
+    position      ← linescores item "currentPosition"  (int rank after round,
+                                                         stored as string to allow
+                                                         "T5" format if ESPN adds it)
+    is_playoff    ← linescores item "isPlayoff"        (bool, default False)
+    """
+
+    __tablename__ = "tournament_entry_rounds"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_entry_id", "round_number", name="uq_entry_round_number"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tournament_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("tournament_entries.id"), nullable=False
+    )
+
+    # ESPN "period": 1–4 for standard rounds, 5+ for playoff rounds.
+    round_number: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # ESPN "teeTime": golfer's scheduled start time for this round (UTC).
+    # Null until the tee sheet is released (usually Tuesday/Wednesday).
+    tee_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # ESPN "value": total strokes taken in this round (e.g. 68).
+    # Null for rounds not yet played.
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ESPN "displayValue" parsed to int: "-2"→-2, "E"→0, "+1"→1.
+    # Represents this round's score relative to par. Null until round completes.
+    score_to_par: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ESPN "currentPosition" (integer rank) stored as a string.
+    # Using String to allow positional strings like "T5" or "CUT" if ESPN
+    # ever surfaces them here. Null until the round is complete.
+    position: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    # ESPN "isPlayoff": True for playoff rounds (period 5+). False for standard.
+    is_playoff: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    entry: Mapped["TournamentEntry"] = relationship(back_populates="rounds")

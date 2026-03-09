@@ -9,7 +9,7 @@ from app.models.user import User
 from app.models.league import League, LeagueMember, LeagueMemberRole, LeagueMemberStatus
 from app.models.season import Season
 from app.models.golfer import Golfer
-from app.models.tournament import Tournament, TournamentEntry, TournamentStatus
+from app.models.tournament import Tournament, TournamentEntry, TournamentEntryRound, TournamentStatus
 from app.models.pick import Pick
 from app.models.league_tournament import LeagueTournament
 
@@ -24,6 +24,7 @@ __all__ = [
     "Golfer",
     "Tournament",
     "TournamentEntry",
+    "TournamentEntryRound",
     "TournamentStatus",
     "Pick",
     "LeagueTournament",
