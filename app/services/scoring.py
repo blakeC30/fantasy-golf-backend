@@ -32,7 +32,7 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
     scheduled_ids_subq = (
         db.query(LeagueTournament.tournament_id)
         .filter(LeagueTournament.league_id == league.id)
-        .subquery()
+        .scalar_subquery()
     )
     season_tournaments = (
         db.query(Tournament)

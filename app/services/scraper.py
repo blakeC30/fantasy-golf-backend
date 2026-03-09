@@ -267,6 +267,38 @@ def _fetch_competitor_rounds(
     return athlete_id, rounds
 
 
+def _fetch_competitor_status(
+    event_id: str,
+    competition_id: str,
+    competitor_id: str,
+) -> tuple[str, str | None]:
+    """
+    Fetch a competitor's final status from the ESPN /status sub-endpoint.
+
+    Returns (competitor_id, short_detail) where short_detail is one of:
+      "F"   → finished normally (active, no special status)
+      "WD"  → withdrew before or during the tournament
+      "CUT" → missed the cut after round 2
+      "MDF" → made the cut, did not finish (rare format-specific cut)
+      "DQ"  → disqualified
+      None  → fetch failed or status unrecognised
+    """
+    url = (
+        f"{_CORE_API_BASE}/events/{event_id}"
+        f"/competitions/{competition_id}/competitors/{competitor_id}/status"
+    )
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return competitor_id, None
+            data = resp.json()
+            return competitor_id, data.get("type", {}).get("shortDetail")
+    except httpx.RequestError as exc:
+        log.warning("Could not fetch status for competitor %s: %s", competitor_id, exc)
+        return competitor_id, None
+
+
 def _fetch_tournament_data(
     pga_tour_id: str,
     known_golfer_ids: set[str] | None = None,
@@ -354,6 +386,24 @@ def _fetch_tournament_data(
             pga_tour_id, len(rounds_by_athlete), non_empty,
         )
 
+    # Step 4 (optional): fetch per-competitor status (WD / CUT / DQ / MDF / F).
+    # Only fetched when round data is fetched (i.e. full sync, not schedule-only).
+    _NOTABLE_STATUSES = {"WD", "CUT", "MDF", "DQ"}
+    status_by_athlete: dict[str, str | None] = {}
+    if fetch_round_data and all_athlete_ids:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures_st = {
+                pool.submit(_fetch_competitor_status, pga_tour_id, pga_tour_id, aid): aid
+                for aid in all_athlete_ids
+            }
+            for future in concurrent.futures.as_completed(futures_st):
+                try:
+                    aid, short_detail = future.result()
+                    # Only store notable non-active statuses; active/finished = None.
+                    status_by_athlete[aid] = short_detail if short_detail in _NOTABLE_STATUSES else None
+                except Exception as exc:
+                    log.warning("Status fetch failed: %s", exc)
+
     log.info(
         "Tournament %s: %d competitors, %d new athlete fetches",
         pga_tour_id, len(competitors), len(ids_to_fetch),
@@ -389,7 +439,7 @@ def _fetch_tournament_data(
             "pga_tour_id": athlete_id,
             "finish_position": c.get("order"),
             "earnings_usd": None,
-            "status": None,
+            "status": status_by_athlete.get(athlete_id),
             "tee_time": current_tee_time,
             "rounds": rounds,
             "team_competitor_id": None,
@@ -504,13 +554,14 @@ def _fetch_team_field(
     # Fetch per-round linescores for all individual golfers when requested.
     # For team events the /linescores URL uses the individual athlete_id, not the team_id.
     # rounds_by_athlete maps athlete_id → list of per-round dicts.
+    all_athlete_ids_team = [aid for aid, _, _ in team_entries]
     rounds_by_athlete: dict[str, list[dict]] = {}
+    status_by_athlete_team: dict[str, str | None] = {}
     if fetch_round_data and team_entries:
-        all_athlete_ids = [aid for aid, _, _ in team_entries]
         with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
             futures_rd = {
                 pool.submit(_fetch_competitor_rounds, pga_tour_id, competition_id, aid): aid
-                for aid in all_athlete_ids
+                for aid in all_athlete_ids_team
             }
             for future in concurrent.futures.as_completed(futures_rd):
                 try:
@@ -523,6 +574,19 @@ def _fetch_team_field(
             "Team tournament %s: fetched round data for %d golfers (%d with rounds)",
             pga_tour_id, len(rounds_by_athlete), non_empty,
         )
+
+        _NOTABLE_STATUSES_TEAM = {"WD", "CUT", "MDF", "DQ"}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures_st = {
+                pool.submit(_fetch_competitor_status, pga_tour_id, competition_id, aid): aid
+                for aid in all_athlete_ids_team
+            }
+            for future in concurrent.futures.as_completed(futures_st):
+                try:
+                    aid, short_detail = future.result()
+                    status_by_athlete_team[aid] = short_detail if short_detail in _NOTABLE_STATUSES_TEAM else None
+                except Exception as exc:
+                    log.warning("Status fetch failed: %s", exc)
 
     log.info(
         "Team tournament %s: %d teams → %d individual golfers, %d new athlete fetches",
@@ -553,7 +617,7 @@ def _fetch_team_field(
             "pga_tour_id": athlete_id,
             "finish_position": finish_order,
             "earnings_usd": None,
-            "status": None,
+            "status": status_by_athlete_team.get(athlete_id),
             "tee_time": current_tee_time,
             "rounds": rounds,
             "team_competitor_id": team_id,
@@ -943,7 +1007,65 @@ def score_picks(db: Session, tournament: Tournament) -> int:
 
     db.commit()
     log.info("Scored %d picks for '%s'", count, tournament.name)
+
+    # After scoring picks, back-fill earnings for every other golfer in the field
+    # so the Tournament Detail leaderboard shows earnings for all entrants, not
+    # just league members who submitted a pick.
+    _backfill_field_earnings(db, tournament)
+
     return count
+
+
+def _backfill_field_earnings(db: Session, tournament: Tournament) -> None:
+    """
+    Fetch and store earnings_usd for every TournamentEntry that still has
+    earnings_usd = NULL after score_picks() has run.
+
+    score_picks() only fetches earnings for golfers with actual league picks.
+    This function fills in the rest so the leaderboard can display earnings
+    for the full field.
+
+    One ESPN API call per missing entry — runs synchronously but only touches
+    entries with NULL earnings, so re-runs are cheap (all entries filled after
+    the first completed sync).
+    """
+    entries = (
+        db.query(TournamentEntry)
+        .filter_by(tournament_id=tournament.id)
+        .filter(TournamentEntry.earnings_usd.is_(None))
+        .join(Golfer, TournamentEntry.golfer_id == Golfer.id)
+        .add_columns(Golfer.pga_tour_id.label("golfer_pga_tour_id"))
+        .all()
+    )
+
+    if not entries:
+        return
+
+    log.info(
+        "Back-filling earnings for %d field entries in '%s'",
+        len(entries), tournament.name,
+    )
+
+    for row in entries:
+        entry, golfer_pga_tour_id = row
+
+        if tournament.is_team_event and entry.team_competitor_id:
+            competitor_id = entry.team_competitor_id
+        else:
+            competitor_id = golfer_pga_tour_id
+
+        raw = _fetch_golfer_earnings(
+            tournament.pga_tour_id,
+            competitor_id,
+            competition_id=tournament.competition_id,
+            is_team_event=tournament.is_team_event,
+        )
+        # Store 0 explicitly for golfers who missed the cut (no earnings)
+        # so we don't re-fetch them on future syncs.
+        entry.earnings_usd = raw if raw is not None else 0
+
+    db.commit()
+    log.info("Back-fill complete for '%s'", tournament.name)
 
 
 # ---------------------------------------------------------------------------
@@ -1108,4 +1230,96 @@ def full_sync(db: Session, year: int) -> dict:
         "schedule": schedule_result,
         "tournaments_synced": len(tournament_results),
         "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# On-demand scorecard fetch (hole-by-hole via ESPN linescores)
+# ---------------------------------------------------------------------------
+
+def fetch_golfer_scorecard(
+    tournament: Tournament,
+    golfer: Golfer,
+    round_number: int,
+) -> dict:
+    """Fetch hole-by-hole scoring for a golfer in a specific tournament round.
+
+    Calls ESPN's /linescores endpoint for the competitor and extracts nested
+    hole-level data if available.  Returns a dict matching ScorecardOut;
+    ``holes`` will be an empty list if ESPN doesn't include hole-level data
+    for this round (graceful degradation).
+    """
+    pga_tour_id = tournament.pga_tour_id
+    competition_id = tournament.competition_id or pga_tour_id
+    athlete_id = golfer.pga_tour_id
+
+    url = (
+        f"{_CORE_API_BASE}/events/{pga_tour_id}"
+        f"/competitions/{competition_id}/competitors/{athlete_id}/linescores"
+    )
+    try:
+        data = _get_json(url)
+    except Exception as exc:
+        log.warning("Scorecard fetch failed for golfer %s round %d: %s", athlete_id, round_number, exc)
+        return {
+            "golfer_id": str(golfer.id),
+            "round_number": round_number,
+            "holes": [],
+            "total_score": None,
+            "total_score_to_par": None,
+        }
+
+    holes: list[dict] = []
+    total_score: int | None = None
+    total_score_to_par: int | None = None
+
+    for item in data.get("items", []):
+        if item.get("period") != round_number:
+            continue
+
+        # Round-level totals
+        total_score = item.get("value")
+        display = item.get("displayValue", "")
+        try:
+            total_score_to_par = 0 if display in ("E", "EVEN") else int(display.replace("+", ""))
+        except (ValueError, AttributeError):
+            total_score_to_par = None
+
+        # Hole-level linescores (nested under the round item)
+        for hole_item in item.get("linescores", []):
+            hole_num = hole_item.get("period")
+            score = hole_item.get("value")
+            par = hole_item.get("par")
+            stp: int | None = (score - par) if (score is not None and par is not None) else None
+            result: str | None = None
+            if stp is not None:
+                if stp <= -2:
+                    result = "eagle"
+                elif stp == -1:
+                    result = "birdie"
+                elif stp == 0:
+                    result = "par"
+                elif stp == 1:
+                    result = "bogey"
+                elif stp == 2:
+                    result = "double_bogey"
+                else:
+                    result = "triple_plus"
+            holes.append(
+                {
+                    "hole": hole_num,
+                    "par": par,
+                    "score": score,
+                    "score_to_par": stp,
+                    "result": result,
+                }
+            )
+        break  # found the requested round; stop iterating
+
+    return {
+        "golfer_id": str(golfer.id),
+        "round_number": round_number,
+        "holes": holes,
+        "total_score": total_score,
+        "total_score_to_par": total_score_to_par,
     }

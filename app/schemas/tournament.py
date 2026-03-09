@@ -1,7 +1,8 @@
 """Tournament schemas."""
 
 import uuid
-from datetime import date
+from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -29,3 +30,61 @@ class LeagueTournamentOut(TournamentOut):
     """
 
     effective_multiplier: float
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard schemas
+# ---------------------------------------------------------------------------
+
+class RoundSummaryOut(BaseModel):
+    round_number: int
+    score: int | None
+    score_to_par: int | None
+    position: str | None
+    tee_time: datetime | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LeaderboardEntryOut(BaseModel):
+    golfer_id: str
+    golfer_name: str
+    golfer_pga_tour_id: str
+    golfer_country: str | None
+    finish_position: int | None
+    is_tied: bool
+    made_cut: bool
+    status: str | None
+    earnings_usd: int | None
+    total_score_to_par: int | None
+    rounds: list[RoundSummaryOut]
+
+
+class LeaderboardOut(BaseModel):
+    tournament_id: str
+    tournament_name: str
+    tournament_status: str
+    entries: list[LeaderboardEntryOut]
+
+
+# ---------------------------------------------------------------------------
+# Scorecard schemas
+# ---------------------------------------------------------------------------
+
+HoleResult = Literal["eagle", "birdie", "par", "bogey", "double_bogey", "triple_plus"]
+
+
+class HoleScoreOut(BaseModel):
+    hole: int
+    par: int | None
+    score: int | None
+    score_to_par: int | None
+    result: HoleResult | None
+
+
+class ScorecardOut(BaseModel):
+    golfer_id: str
+    round_number: int
+    holes: list[HoleScoreOut]
+    total_score: int | None
+    total_score_to_par: int | None
