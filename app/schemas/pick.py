@@ -27,6 +27,7 @@ class PickOut(BaseModel):
     points_earned: float | None
     earnings_usd: float | None  # raw golfer earnings before multiplier
     submitted_at: datetime
+    is_locked: bool  # True once the golfer's Round 1 tee time has passed
     golfer: GolferOut
     tournament: TournamentOut
 

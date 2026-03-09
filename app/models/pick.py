@@ -16,7 +16,7 @@ Business rules enforced here (via UniqueConstraint) and in the API layer:
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from typing import TYPE_CHECKING
 
@@ -101,6 +101,28 @@ class Pick(Base):
         if self.entry is not None and self.entry.earnings_usd is not None:
             return float(self.entry.earnings_usd)
         return None
+
+    @property
+    def is_locked(self) -> bool:
+        """
+        True once picking / changing this pick is no longer allowed.
+
+        Lock rules (mirrors the backend validation in services/picks.py):
+          - COMPLETED  → always locked (tournament is over)
+          - IN_PROGRESS → locked once the golfer's Round 1 tee_time has passed,
+                          or immediately if tee_time is null (safety: no data = locked)
+          - SCHEDULED  → never locked here (deadline enforced by start_date check
+                          in validate_new_pick / validate_pick_change)
+        """
+        from app.models.tournament import TournamentStatus
+
+        if self.tournament.status == TournamentStatus.COMPLETED.value:
+            return True
+        if self.tournament.status == TournamentStatus.IN_PROGRESS.value:
+            if self.entry is None or self.entry.tee_time is None:
+                return True  # no tee_time when in_progress → locked (safety)
+            return self.entry.tee_time <= datetime.now(timezone.utc)
+        return False
 
     def __repr__(self) -> str:
         return (
