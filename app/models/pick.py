@@ -103,6 +103,16 @@ class Pick(Base):
         return None
 
     @property
+    def position(self) -> int | None:
+        """Golfer's finishing (or current) position in the tournament."""
+        return self.entry.finish_position if self.entry is not None else None
+
+    @property
+    def is_tied(self) -> bool:
+        """True when multiple golfers share this finish position."""
+        return bool(self.entry and self.entry.is_tied)
+
+    @property
     def is_locked(self) -> bool:
         """
         True once picking / changing this pick is no longer allowed.

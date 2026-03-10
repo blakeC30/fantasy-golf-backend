@@ -74,6 +74,7 @@ The core API endpoints above are the reliable replacement.
 
 import concurrent.futures
 import logging
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -222,6 +223,19 @@ def _fetch_competitor_rounds(
             )
             continue
 
+        # ESPN "isPlayoff": true only for playoff rounds.
+        is_playoff = bool(item.get("isPlayoff", False))
+
+        # Skip ESPN internal/aggregate entries: period numbers > 10 that aren't
+        # flagged as playoff rounds are placeholder rows with no meaningful data
+        # (e.g. period=402 seen in WM Phoenix Open responses).
+        if round_number > 10 and not is_playoff:
+            log.debug(
+                "Skipping non-playoff period %d for athlete %s (likely ESPN internal row)",
+                round_number, athlete_id,
+            )
+            continue
+
         # Parse tee_time from ISO 8601 UTC string (e.g. "2026-03-05T13:45Z").
         tee_time_utc: datetime | None = None
         raw_tee_time = item.get("teeTime")
@@ -236,11 +250,15 @@ def _fetch_competitor_rounds(
                 )
 
         # ESPN "value" is strokes as a float (e.g. 70.0); cast to int.
+        # score=0 means the player did not finish the hole (e.g. conceded in a
+        # playoff once the opponent already won). Treat as None — the round row
+        # still records that the player participated, but no stroke count is shown.
         raw_value = item.get("value")
         score: int | None = None
         if raw_value is not None:
             try:
-                score = int(float(raw_value))
+                parsed_score = int(float(raw_value))
+                score = parsed_score if parsed_score > 0 else None
             except (ValueError, TypeError):
                 pass
 
@@ -251,9 +269,6 @@ def _fetch_competitor_rounds(
         # Stored as a string to accommodate future positional formats (e.g. "T5").
         raw_pos = item.get("currentPosition")
         position: str | None = str(raw_pos) if raw_pos is not None else None
-
-        # ESPN "isPlayoff": true only for playoff rounds.
-        is_playoff = bool(item.get("isPlayoff", False))
 
         rounds.append({
             "round_number": round_number,
@@ -842,6 +857,7 @@ def upsert_field(
 
     golfers_synced = 0
     entries_synced = 0
+    entry_by_pga_id: dict[str, TournamentEntry] = {}  # track for position recompute
 
     for g in golfers:
         # Upsert golfer profile.
@@ -874,8 +890,9 @@ def upsert_field(
                 entry.finish_position = result["finish_position"]
             if result.get("earnings_usd") is not None:
                 entry.earnings_usd = result["earnings_usd"]
-            if result.get("status") is not None:
-                entry.status = result["status"]
+            # Always overwrite status — None means "active/finished" and must be
+            # able to clear a previously incorrect value (e.g. a bad backfill).
+            entry.status = result.get("status")
             if result.get("tee_time") is not None:
                 entry.tee_time = result["tee_time"]
             if result.get("team_competitor_id") is not None:
@@ -927,7 +944,43 @@ def upsert_field(
                         is_playoff=rd.get("is_playoff", False),
                     ))
 
+        entry_by_pga_id[g["pga_tour_id"]] = entry
         golfers_synced += 1
+
+    # Recompute display positions from score_to_par totals so that tied golfers
+    # share the same finish_position (e.g. T6 → all get 6, is_tied=True).
+    # ESPN's "order" field is sequential and never repeats for ties, so we
+    # ignore it and compute our own ranks from the round data we just upserted.
+    stp_by_pga_id: dict[str, int | None] = {}
+    for result in results:
+        pid = result["pga_tour_id"]
+        rounds = result.get("rounds", [])
+        valid_stps = [r["score_to_par"] for r in rounds if r.get("score_to_par") is not None]
+        stp_by_pga_id[pid] = sum(valid_stps) if valid_stps else None
+
+    stp_counts: Counter[int] = Counter(
+        stp for stp in stp_by_pga_id.values() if stp is not None
+    )
+    sorted_pga_ids = sorted(
+        stp_by_pga_id.keys(),
+        key=lambda pid: (stp_by_pga_id[pid] is None, stp_by_pga_id[pid] if stp_by_pga_id[pid] is not None else 0),
+    )
+    rank = 1
+    for i, pid in enumerate(sorted_pga_ids):
+        stp = stp_by_pga_id[pid]
+        if i > 0:
+            prev_stp = stp_by_pga_id[sorted_pga_ids[i - 1]]
+            if prev_stp != stp:
+                rank = i + 1
+        entry = entry_by_pga_id.get(pid)
+        if entry is None:
+            continue
+        if stp is not None:
+            entry.finish_position = rank
+            entry.is_tied = stp_counts[stp] > 1
+        else:
+            # No round data yet — leave ESPN order in place, not tied
+            entry.is_tied = False
 
     db.commit()
     return golfers_synced, entries_synced
@@ -1091,7 +1144,7 @@ def sync_schedule(db: Session, year: int) -> dict:
     return {"year": year, "tournaments_created": created, "tournaments_updated": updated}
 
 
-def sync_tournament(db: Session, pga_tour_id: str) -> dict:
+def sync_tournament(db: Session, pga_tour_id: str, *, force: bool = False) -> dict:
     """
     Sync the field and results for a single tournament using the ESPN core API.
 
@@ -1104,6 +1157,10 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
     covers tee times for upcoming rounds (for pick-locking) and historical
     round scores for completed tournaments.
 
+    force=True: delete all TournamentEntryRound rows for this tournament before
+    re-fetching. Use when ESPN has corrected data that is stale in the DB
+    (e.g. wrong status, phantom rounds, missing playoff data).
+
     Returns a summary dict with counts.
     """
     tournament = db.query(Tournament).filter_by(pga_tour_id=pga_tour_id).first()
@@ -1111,7 +1168,20 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
         raise ValueError(f"Tournament with pga_tour_id '{pga_tour_id}' not found in DB. "
                          "Run sync_schedule first.")
 
-    log.info("Syncing tournament '%s' (id=%s, team=%s)", tournament.name, pga_tour_id, tournament.is_team_event)
+    log.info("Syncing tournament '%s' (id=%s, team=%s, force=%s)", tournament.name, pga_tour_id, tournament.is_team_event, force)
+
+    if force:
+        # Delete all round rows for this tournament so stale ESPN data is fully replaced.
+        # Entry-level fields (status, earnings, finish_position) are reset to None so
+        # the upcoming upsert writes fresh values from ESPN unconditionally.
+        entries = db.query(TournamentEntry).filter_by(tournament_id=tournament.id).all()
+        for entry in entries:
+            db.query(TournamentEntryRound).filter_by(tournament_entry_id=entry.id).delete()
+            entry.status = None
+            entry.finish_position = None
+            entry.earnings_usd = None
+        db.commit()
+        log.info("Force sync: cleared %d entries' round data for '%s'", len(entries), tournament.name)
 
     # Fetch purse from the core event endpoint (site API scoreboard doesn't include it).
     try:
@@ -1175,13 +1245,16 @@ def sync_tournament(db: Session, pga_tour_id: str) -> dict:
     }
 
 
-def full_sync(db: Session, year: int) -> dict:
+def full_sync(db: Session, year: int, *, force: bool = False) -> dict:
     """
     Run a complete sync for an entire year:
       1. Fetch the schedule and upsert all tournaments.
       2. For each IN_PROGRESS or COMPLETED tournament, sync its field + results.
       3. Also sync the single next SCHEDULED tournament so the pick form has
          a golfer list to show.
+
+    force=True clears all existing round data before re-fetching (same as
+    calling sync_tournament with force=True for each tournament).
 
     This is what the scheduler calls daily and what /admin/sync triggers.
     """
@@ -1216,7 +1289,7 @@ def full_sync(db: Session, year: int) -> dict:
         t_id = t.pga_tour_id
         t_name = t.name
         try:
-            result = sync_tournament(db, t_id)
+            result = sync_tournament(db, t_id, force=force)
             tournament_results.append(result)
         except Exception as exc:
             # A failed flush invalidates the current transaction. Roll it back

@@ -192,6 +192,7 @@ Existing migration files (in order):
 8. `d2e5f8a3c1b7` — add `league_tournaments.multiplier` (per-league override)
 9. `e3f7a1c2d9b8` — add `tournament_entry_round_times` table (per-round tee times)
 10. `f1a4b7c9e2d3` — replace `tournament_entry_round_times` with `tournament_entry_rounds` (full per-round data: score, score_to_par, position, tee_time, is_playoff)
+11. `c9d3f2a8e5b1` — add `tournament_entries.is_tied` (bool, default false); finish_position now stores computed display position accounting for ties
 
 New migrations still go in `alembic/versions/` with correct `down_revision` chaining, but are applied manually via psql.
 

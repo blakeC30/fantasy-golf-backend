@@ -152,9 +152,9 @@ def get_leaderboard(
     # display positions from the actual scores.
     from collections import Counter
 
-    stp_per_entry: dict[int, int | None] = {}  # entry.id → total_stp
+    stp_per_entry: dict[int, int | None] = {}  # entry.id → regulation total_stp (playoffs excluded)
     for entry in entries:
-        scored = [r for r in entry.rounds if r.score_to_par is not None]
+        scored = [r for r in entry.rounds if r.score_to_par is not None and not r.is_playoff]
         stp_per_entry[entry.id] = sum(r.score_to_par for r in scored) if scored else None
 
     _BOTTOM_STATUSES = {"WD", "CUT", "MDF", "DQ"}

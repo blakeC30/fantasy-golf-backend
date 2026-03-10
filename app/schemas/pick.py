@@ -28,6 +28,8 @@ class PickOut(BaseModel):
     earnings_usd: float | None  # raw golfer earnings before multiplier
     submitted_at: datetime
     is_locked: bool  # True once the golfer's Round 1 tee time has passed
+    position: int | None  # from TournamentEntry; None if not yet scored
+    is_tied: bool  # True when multiple golfers share this finish position
     golfer: GolferOut
     tournament: TournamentOut
 

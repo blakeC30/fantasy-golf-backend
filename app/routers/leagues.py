@@ -21,9 +21,14 @@ Endpoints:
 import datetime
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+LEAGUE_MEMBER_CAP = 500
+LEAGUE_PENDING_CAP = LEAGUE_MEMBER_CAP // 5  # 100
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
+
+from app.limiter import limiter
 
 from app.database import get_db
 from app.dependencies import get_current_user, get_league_or_404, require_league_manager, require_league_member
@@ -155,7 +160,9 @@ def my_join_requests(
 
 
 @router.post("/join/{invite_code}", response_model=LeagueMemberOut, status_code=201)
+@limiter.limit("10/hour")
 def request_to_join(
+    request: Request,
     invite_code: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -170,6 +177,9 @@ def request_to_join(
 
     The invite code is shared by league managers; it is the only way to request
     membership. Admins can find their invite link in the Admin panel.
+
+    Rate-limited to 10 requests per IP per hour to prevent invite-code brute-forcing.
+    Max 50 pending requests per league. Max 500 approved members per league.
     """
     league = db.query(League).filter_by(invite_code=invite_code).first()
     if not league:
@@ -183,7 +193,27 @@ def request_to_join(
             raise HTTPException(status_code=409, detail="You are already a member of this league")
         raise HTTPException(status_code=409, detail="You already have a pending join request for this league")
 
-    # Public leagues skip the approval step.
+    # Guard: too many pending requests already in the queue for this league.
+    pending_count = db.query(LeagueMember).filter_by(
+        league_id=league.id, status=LeagueMemberStatus.PENDING.value
+    ).count()
+    if pending_count >= LEAGUE_PENDING_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail="This league has too many pending join requests. Please try again later or contact the league manager.",
+        )
+
+    # Public leagues skip the approval step — check member cap before auto-approving.
+    if league.is_public:
+        approved_count = db.query(LeagueMember).filter_by(
+            league_id=league.id, status=LeagueMemberStatus.APPROVED.value
+        ).count()
+        if approved_count >= LEAGUE_MEMBER_CAP:
+            raise HTTPException(
+                status_code=400,
+                detail=f"This league has reached its maximum member limit of {LEAGUE_MEMBER_CAP}.",
+            )
+
     initial_status = (
         LeagueMemberStatus.APPROVED.value
         if league.is_public
@@ -371,6 +401,17 @@ def approve_join_request(
     )
     if not membership:
         raise HTTPException(status_code=404, detail="Pending request not found")
+
+    # Guard: league member cap — checked here so admins can't accidentally exceed it
+    # by approving multiple pending requests when the league is nearly full.
+    approved_count = db.query(LeagueMember).filter_by(
+        league_id=league.id, status=LeagueMemberStatus.APPROVED.value
+    ).count()
+    if approved_count >= LEAGUE_MEMBER_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This league has reached its maximum member limit of {LEAGUE_MEMBER_CAP}. Remove a member before approving new ones.",
+        )
 
     membership.status = LeagueMemberStatus.APPROVED.value
     db.commit()

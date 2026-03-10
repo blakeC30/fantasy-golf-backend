@@ -42,6 +42,7 @@ class RoundSummaryOut(BaseModel):
     score_to_par: int | None
     position: str | None
     tee_time: datetime | None
+    is_playoff: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -168,8 +168,12 @@ class TournamentEntry(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    # Null until the tournament ends and official results are published.
+    # Display leaderboard position computed from score_to_par totals (not ESPN's
+    # sequential order). Tied golfers share the same number (T6 → finish_position=6).
+    # Set during sync; null until the golfer has played at least one hole.
     finish_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # True when two or more golfers share this finish_position.
+    is_tied: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false", default=False)
 
     # Prize money in whole USD dollars. Null until tournament completes.
     earnings_usd: Mapped[int | None] = mapped_column(
