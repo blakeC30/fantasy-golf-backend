@@ -207,7 +207,35 @@ ESPN unofficial API — no auth required, but undocumented and may change.
 
 **Team events (Zurich Classic):** `competition_id` on Tournament may differ from `pga_tour_id`. Earnings fetched via `team_competitor_id` (stored on TournamentEntry), then divided by 2 for per-golfer share.
 
-Scraper jobs run daily at 06:00 UTC (schedule sync) and Monday 09:00 UTC (finalize results). Manual trigger via `POST /admin/sync`.
+Manual trigger via `POST /admin/sync` (calls scraper functions directly, works from either container).
+
+## Scraper Container Architecture
+
+The scraper runs as a **separate container** from the API. This isolates scraper failures from API availability and lets both be deployed independently.
+
+| Container | Entrypoint | Dockerfile target |
+|---|---|---|
+| API | `app/main.py` (uvicorn) | `--target api` |
+| Scraper | `app/scraper_main.py` | `--target scraper` |
+
+Both containers connect to the same PostgreSQL DB. The scraper only writes; it serves no HTTP requests.
+
+### Scheduler Jobs (in `app/services/scheduler.py`)
+
+All scheduling is **status-driven, not calendar-driven** — no hardcoded weekdays.
+
+| Job ID | Schedule | Trigger condition |
+|---|---|---|
+| `schedule_sync` | Daily 06:00 UTC | Always |
+| `field_sync_d2` | Daily 14:00 UTC | Tournament starts in 2 days |
+| `field_sync_d1` | Daily 18:00 UTC | Tournament starts tomorrow |
+| `field_sync_d0` | Daily 11:00 UTC | Tournament starts today |
+| `live_score_sync` | Every 10 minutes | `tournament.status == "in_progress"` AND within play window |
+| `results_finalization` | Daily 09:00, 15:00, 21:00 UTC | Completed tournament with unscored picks |
+
+**Live sync play window:** Computed from `tournament_entry_rounds.tee_time` values stored in the DB (UTC-aware). If no tee times yet: wide fallback `[10:00–07:00 UTC]` covers all PGA Tour locations (US East through Hawaii). No day-of-week restriction — Monday weather carryovers continue syncing automatically.
+
+**Results finalization:** 3× daily so any finish time on any day is caught (Sunday night, Monday, or Tuesday delays).
 
 ## Testing
 

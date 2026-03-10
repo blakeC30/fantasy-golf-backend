@@ -31,20 +31,19 @@ async def lifespan(_app: FastAPI):
     This replaces the deprecated @app.on_event() decorators. Keeping startup
     and shutdown in one context manager makes the lifecycle explicit and
     ensures shutdown always runs even if startup raises an exception.
+
+    NOTE: The ESPN sync scheduler is NOT started here. It runs in a separate
+    scraper container (app/scraper_main.py) so that scraper failures cannot
+    affect API availability, and the two can be deployed independently.
+    Manual sync triggers remain available via POST /admin/sync.
     """
-    log.info("Starting Fantasy Golf API")
-    from app.services.scheduler import start_scheduler
-    start_scheduler()
-
+    log.info("Starting League Caddie API")
     yield
-
-    log.info("Shutting down Fantasy Golf API")
-    from app.services.scheduler import stop_scheduler
-    stop_scheduler()
+    log.info("Shutting down League Caddie API")
 
 
 app = FastAPI(
-    title="Fantasy Golf API",
+    title="League Caddie API",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs" if settings.DEBUG else None,

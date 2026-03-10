@@ -199,15 +199,63 @@ def get_leaderboard(
 
     stp_counts: Counter = Counter(v for v in stp_per_entry.values() if v is not None)
 
+    # Break ties resolved by a playoff.
+    # Tied groups (same regulation stp) that include at least one entry with a
+    # playoff round have their tie broken by the currentPosition ESPN recorded
+    # after the final playoff round (winner = "1", runner-up = "2", etc.).
+    # This gives the winner position 1 (not T1) and the loser position 2.
+    playoff_tie_broken: set[int] = set()  # entry.id values whose tie was resolved
+    tied_groups: dict[int, list] = {}
+    for e in entries:
+        if e.status in _BOTTOM_STATUSES:
+            continue
+        stp = stp_per_entry[e.id]
+        if stp is not None and stp_counts.get(stp, 0) > 1:
+            tied_groups.setdefault(stp, []).append(e)
+
+    for stp, group in tied_groups.items():
+        entries_with_playoff = [e for e in group if any(r.is_playoff for r in e.rounds)]
+        if not entries_with_playoff:
+            continue  # pure regulation tie — leave as-is
+
+        def _playoff_pos(e) -> int:
+            last = max((r for r in e.rounds if r.is_playoff), key=lambda r: r.round_number)
+            try:
+                return int(last.position) if last.position else 9999
+            except (ValueError, TypeError):
+                return 9999
+
+        sorted_group = sorted(entries_with_playoff, key=_playoff_pos)
+        base_pos = display_position[sorted_group[0].id]
+        for offset, e in enumerate(sorted_group):
+            display_position[e.id] = base_pos + offset
+            playoff_tie_broken.add(e.id)
+
+    # For team events, build a lookup from golfer_id → partner entry using team_competitor_id.
+    partner_by_golfer_id: dict = {}  # golfer_id (UUID) → partner TournamentEntry
+    if tournament.is_team_event:
+        teams: dict[str, list] = {}
+        for entry in entries:
+            if entry.team_competitor_id:
+                teams.setdefault(entry.team_competitor_id, []).append(entry)
+        for team_entries in teams.values():
+            if len(team_entries) == 2:
+                e1, e2 = team_entries
+                partner_by_golfer_id[e1.golfer_id] = e2
+                partner_by_golfer_id[e2.golfer_id] = e1
+
     result_entries: list[LeaderboardEntryOut] = []
     for entry in entries:
         rounds_sorted = sorted(entry.rounds, key=lambda r: r.round_number)
         total_stp = stp_per_entry[entry.id]
-        is_tied = stp_counts.get(total_stp, 0) > 1 if total_stp is not None else False
+        is_tied = (
+            stp_counts.get(total_stp, 0) > 1 and entry.id not in playoff_tie_broken
+        ) if total_stp is not None else False
         # made_cut: true only for active/finished players (no special status).
         # This drives the single "Cut Line" divider in the UI — everyone with
         # a notable status (CUT, WD, MDF, DQ) appears below the divider.
         made_cut = entry.status not in _BOTTOM_STATUSES
+        partner = partner_by_golfer_id.get(entry.golfer_id)
         result_entries.append(
             LeaderboardEntryOut(
                 golfer_id=str(entry.golfer_id),
@@ -221,6 +269,9 @@ def get_leaderboard(
                 earnings_usd=entry.earnings_usd,
                 total_score_to_par=total_stp,
                 rounds=[RoundSummaryOut.model_validate(r) for r in rounds_sorted],
+                partner_name=partner.golfer.name if partner else None,
+                partner_golfer_id=str(partner.golfer_id) if partner else None,
+                partner_golfer_pga_tour_id=partner.golfer.pga_tour_id if partner else None,
             )
         )
 
@@ -228,6 +279,7 @@ def get_leaderboard(
         tournament_id=str(tournament_id),
         tournament_name=tournament.name,
         tournament_status=tournament.status,
+        is_team_event=tournament.is_team_event,
         entries=result_entries,
     )
 

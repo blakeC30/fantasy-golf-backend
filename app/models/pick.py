@@ -27,7 +27,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base
 
 if TYPE_CHECKING:
-    from app.models.tournament import TournamentEntry
+    from app.models.league import League
+    from app.models.season import Season
+    from app.models.user import User
+    from app.models.tournament import Tournament, TournamentEntry
+    from app.models.golfer import Golfer
 
 
 class Pick(Base):

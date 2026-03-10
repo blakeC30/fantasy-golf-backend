@@ -982,6 +982,39 @@ def upsert_field(
             # No round data yet — leave ESPN order in place, not tied
             entry.is_tied = False
 
+    # Break ties that were resolved by a playoff.
+    #
+    # The score-to-par recomputation above correctly marks regulation ties as
+    # is_tied=True, but a playoff winner and loser share the same regulation
+    # score-to-par so they end up tied too. ESPN's "order" field IS updated
+    # after the playoff to reflect the final result (1st, 2nd, …), so we use
+    # it to split any tied group that includes players with playoff round data.
+    espn_order_by_pga_id: dict[str, int | None] = {
+        r["pga_tour_id"]: r.get("finish_position") for r in results
+    }
+    has_playoff_by_pga_id: dict[str, bool] = {
+        r["pga_tour_id"]: any(rd.get("is_playoff") for rd in r.get("rounds", []))
+        for r in results
+    }
+    # Collect tied groups that contain at least one playoff participant.
+    playoff_tie_groups: dict[int, list[str]] = {}
+    for pid, stp in stp_by_pga_id.items():
+        if stp is not None and has_playoff_by_pga_id.get(pid):
+            entry = entry_by_pga_id.get(pid)
+            if entry and entry.is_tied:
+                playoff_tie_groups.setdefault(stp, []).append(pid)
+    # Within each such group, reassign unique positions using ESPN's final order.
+    for stp, pids in playoff_tie_groups.items():
+        sorted_pids = sorted(
+            pids, key=lambda p: espn_order_by_pga_id.get(p) or 9999
+        )
+        base_rank = entry_by_pga_id[sorted_pids[0]].finish_position
+        for offset, pid in enumerate(sorted_pids):
+            entry = entry_by_pga_id.get(pid)
+            if entry:
+                entry.finish_position = base_rank + offset
+                entry.is_tied = False
+
     db.commit()
     return golfers_synced, entries_synced
 

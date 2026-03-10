@@ -141,14 +141,20 @@ def get_my_picks(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return the current user's picks for the active season."""
+    """Return the current user's picks for the active season, scoped to the league's schedule."""
     league, _ = league_and_member
+    scheduled_tournament_ids = (
+        db.query(LeagueTournament.tournament_id)
+        .filter_by(league_id=league.id)
+        .scalar_subquery()
+    )
     return (
         _picks_with_relations(
-            db.query(Pick).filter_by(
-                league_id=league.id,
-                season_id=season.id,
-                user_id=current_user.id,
+            db.query(Pick).filter(
+                Pick.league_id == league.id,
+                Pick.season_id == season.id,
+                Pick.user_id == current_user.id,
+                Pick.tournament_id.in_(scheduled_tournament_ids),
             )
         )
         .all()
@@ -168,12 +174,20 @@ def get_all_picks(
     members from copying each other's choices.
     """
     league, _ = league_and_member
+    scheduled_tournament_ids = (
+        db.query(LeagueTournament.tournament_id)
+        .filter_by(league_id=league.id)
+        .scalar_subquery()
+    )
     return (
         _picks_with_relations(
             db.query(Pick)
             .filter_by(league_id=league.id, season_id=season.id)
             .join(Pick.tournament)
-            .filter_by(status=TournamentStatus.COMPLETED.value)
+            .filter(
+                Tournament.status == TournamentStatus.COMPLETED.value,
+                Tournament.id.in_(scheduled_tournament_ids),
+            )
         )
         .all()
     )
@@ -356,6 +370,15 @@ def admin_override_pick(
     override and intentionally bypasses the normal pick rules.
     """
     league, _ = league_and_manager
+
+    # Verify the tournament is in this league's schedule
+    lt = (
+        db.query(LeagueTournament)
+        .filter_by(league_id=league.id, tournament_id=body.tournament_id)
+        .first()
+    )
+    if not lt:
+        raise HTTPException(status_code=422, detail="Tournament is not in this league's schedule")
 
     # Verify the target user is an approved member of this league
     membership = (

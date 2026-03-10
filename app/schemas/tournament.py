@@ -59,12 +59,17 @@ class LeaderboardEntryOut(BaseModel):
     earnings_usd: int | None
     total_score_to_par: int | None
     rounds: list[RoundSummaryOut]
+    # Team event fields — None for individual tournaments
+    partner_name: str | None = None
+    partner_golfer_id: str | None = None
+    partner_golfer_pga_tour_id: str | None = None
 
 
 class LeaderboardOut(BaseModel):
     tournament_id: str
     tournament_name: str
     tournament_status: str
+    is_team_event: bool
     entries: list[LeaderboardEntryOut]
 
 
