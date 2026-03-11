@@ -45,13 +45,15 @@ app/
 │   ├── golfers.py    # /golfers/*
 │   ├── picks.py      # /leagues/{league_id}/picks/*
 │   ├── standings.py  # /leagues/{league_id}/standings
+│   ├── playoff.py    # /leagues/{league_id}/playoff/* (config, bracket, draft, pods)
 │   └── admin.py      # /admin/* (platform admin only)
 └── services/
     ├── auth.py       # hash_password, verify_password, create/decode JWT tokens, verify_google_id_token
-    ├── picks.py      # validate_new_pick(), validate_pick_change() — raises HTTPException
+    ├── picks.py      # validate_new_pick(), validate_pick_change(), all_r1_teed_off() — raises HTTPException
     ├── scoring.py    # calculate_standings() — returns list[dict]
     ├── scraper.py    # ESPN API client, upsert functions, full_sync / sync_tournament
-    └── scheduler.py  # APScheduler setup — starts on FastAPI startup, runs scraper jobs
+    ├── scheduler.py  # APScheduler setup — starts on FastAPI startup, runs scraper jobs
+    └── playoff.py    # seed_playoff, resolve_draft, score_round, advance_bracket, override_result
 
 alembic/
 └── versions/         # Migration files — see Migration section
@@ -91,7 +93,7 @@ All routes are prefixed with `/api/v1`.
 | DELETE | `/leagues/{league_id}/requests/me` | token | User withdraws own request |
 | DELETE | `/leagues/{league_id}/requests/{user_id}` | manager | Deny request |
 | GET | `/leagues/{league_id}/tournaments` | member | League's selected tournaments (returns `LeagueTournamentOut` with `effective_multiplier`) |
-| PUT | `/leagues/{league_id}/tournaments` | manager | Atomically replace schedule; body: `{tournaments: [{tournament_id, multiplier?}]}` |
+| PUT | `/leagues/{league_id}/tournaments` | manager | Atomically replace schedule; body: `{tournaments: [{tournament_id, multiplier?}]}`; validates sufficient future tournaments for playoff config if pending |
 | GET | `/tournaments` | token | All/filtered by status |
 | GET | `/tournaments/{id}` | token | Tournament details |
 | GET | `/tournaments/{id}/field` | token | Golfers in field |
@@ -104,6 +106,21 @@ All routes are prefixed with `/api/v1`.
 | GET | `/leagues/{league_id}/standings` | member | Season standings |
 | POST | `/admin/sync` | platform_admin | Full ESPN data sync |
 | POST | `/admin/sync/{pga_tour_id}` | platform_admin | Sync single tournament |
+| POST | `/leagues/{league_id}/playoff/config` | manager | Create playoff config for active season (always sets is_enabled=True) |
+| GET | `/leagues/{league_id}/playoff/config` | member | Get playoff config |
+| PATCH | `/leagues/{league_id}/playoff/config` | manager | Update config (only when status=pending) |
+| GET | `/leagues/{league_id}/playoff/bracket` | member | Full bracket — all rounds, pods, picks |
+| POST | `/leagues/{league_id}/playoff/rounds/{round_id}/open` | manager | Open draft (auto-seeds bracket on round 1 when status=pending; pending→drafting) |
+| POST | `/leagues/{league_id}/playoff/rounds/{round_id}/resolve` | manager | Process preferences → picks (drafting→locked) |
+| POST | `/leagues/{league_id}/playoff/rounds/{round_id}/score` | manager | Populate points_earned from tournament results |
+| POST | `/leagues/{league_id}/playoff/rounds/{round_id}/advance` | manager | Determine winners, create next-round pods |
+| GET | `/leagues/{league_id}/playoff/pods/{pod_id}` | member | Pod detail (members + picks) |
+| GET | `/leagues/{league_id}/playoff/pods/{pod_id}/draft` | member | Draft status (who submitted, resolved picks) |
+| GET | `/leagues/{league_id}/playoff/pods/{pod_id}/preferences` | member | My ranked preference list |
+| PUT | `/leagues/{league_id}/playoff/pods/{pod_id}/preferences` | member | Submit/replace ranked preference list |
+| POST | `/leagues/{league_id}/playoff/override` | manager | Manually set pod winner |
+| GET | `/leagues/{league_id}/playoff/my-pod` | member | Lightweight playoff pod context for current user — always 200, returns `is_playoff_week=False` if no active playoff config; used by Dashboard/MakePick |
+| GET | `/leagues/{league_id}/playoff/my-picks` | member | Current user's playoff picks per tournament (all rounds in active season) — own picks never hidden by R1 tee time check |
 
 **CRITICAL — FastAPI route ordering**: Literal path segments must be defined BEFORE parameterized ones. Example in `leagues.py`:
 ```python
@@ -161,6 +178,12 @@ Always call `db.commit()` explicitly. Never rely on auto-commit. Use `db.refresh
 | `golfers` | pga_tour_id (unique), name, world_ranking, country |
 | `picks` | league_id, season_id, user_id, tournament_id, golfer_id, points_earned (nullable); UNIQUE(league_id, season_id, user_id, tournament_id) |
 | `league_tournaments` | league_id, tournament_id, multiplier (float nullable); UNIQUE(league_id, tournament_id) |
+| `playoff_configs` | id (UUID), league_id, season_id, is_enabled, playoff_size, draft_style, picks_per_round (JSON int array, one entry per round), status, seeded_at; UNIQUE(league_id, season_id) |
+| `playoff_rounds` | id (int), playoff_config_id, round_number, tournament_id (nullable), draft_opens_at, draft_resolved_at, status; UNIQUE(playoff_config_id, round_number) |
+| `playoff_pods` | id (int), playoff_round_id, bracket_position, winner_user_id (nullable), status; UNIQUE(playoff_round_id, bracket_position) |
+| `playoff_pod_members` | id (int), pod_id, user_id, seed, draft_position, total_points (nullable), is_eliminated; UNIQUE(pod_id, user_id) |
+| `playoff_picks` | id (UUID), pod_id, pod_member_id, golfer_id, tournament_id, draft_slot, points_earned; UNIQUE(pod_id, golfer_id) |
+| `playoff_draft_preferences` | id (UUID), pod_id, pod_member_id, golfer_id, rank; UNIQUE(pod_member_id, golfer_id) |
 
 ### Points Formula
 ```
@@ -193,6 +216,10 @@ Existing migration files (in order):
 9. `e3f7a1c2d9b8` — add `tournament_entry_round_times` table (per-round tee times)
 10. `f1a4b7c9e2d3` — replace `tournament_entry_round_times` with `tournament_entry_rounds` (full per-round data: score, score_to_par, position, tee_time, is_playoff)
 11. `c9d3f2a8e5b1` — add `tournament_entries.is_tied` (bool, default false); finish_position now stores computed display position accounting for ties
+12. `a1b2c3d4e5f6` — add playoff tables (playoff_configs, playoff_rounds, playoff_pods, playoff_pod_members, playoff_picks, playoff_draft_preferences)
+13. `d4f6a2e8b1c9` — add `league_tournaments.is_playoff` (bool, default false)
+14. `e5f1a9b2c3d4` — drop `league_tournaments.is_playoff` — playoff rounds are now auto-selected as the last N scheduled tournaments in the league's schedule
+15. `e5g9b3c7f2a1` — replace `playoff_configs.round1_picks_per_player` + `subsequent_picks_per_player` with `picks_per_round` (JSONB int array, one element per round)
 
 New migrations still go in `alembic/versions/` with correct `down_revision` chaining, but are applied manually via psql.
 
@@ -200,10 +227,13 @@ New migrations still go in `alembic/versions/` with correct `down_revision` chai
 
 ESPN unofficial API — no auth required, but undocumented and may change.
 
-- `sync_schedule(db, year)` — fetch PGA Tour schedule for a year, upsert Tournaments
+- `sync_schedule(db, year)` — fetch PGA Tour schedule for a year, upsert Tournaments; also trims any post-Tour-Championship rows
 - `sync_tournament(db, pga_tour_id)` — sync field + score picks; routes to team or individual path based on `is_team_event`
 - `full_sync(db, year)` — sync schedule then all in-progress/completed + next scheduled tournament
 - `score_picks(db, tournament)` — populate `picks.points_earned` for completed tournament
+- `_trim_post_championship_tournaments(db)` — deletes any Tournament rows starting after the Tour Championship ends (called by `sync_schedule`)
+
+**Tour Championship cutoff:** The Tour Championship is the last valid fantasy-season event. `parse_schedule_response` filters out any ESPN events that start after it ends. `sync_schedule` also calls `_trim_post_championship_tournaments` to clean up any rows that slipped in before this rule existed. Post-Tour-Championship tournaments cannot be added to any league schedule.
 
 **Team events (Zurich Classic):** `competition_id` on Tournament may differ from `pga_tour_id`. Earnings fetched via `team_competitor_id` (stored on TournamentEntry), then divided by 2 for per-golfer share.
 

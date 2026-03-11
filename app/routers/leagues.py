@@ -19,6 +19,7 @@ Endpoints:
 """
 
 import datetime
+import math
 import uuid
 
 LEAGUE_MEMBER_CAP = 500
@@ -39,6 +40,7 @@ from app.models import (
     LeagueMemberStatus,
     LeagueTournament,
     Pick,
+    PlayoffConfig,
     Season,
     Tournament,
     User,
@@ -273,14 +275,18 @@ def delete_league(
 ):
     """
     Permanently delete a league and all associated data (picks, seasons,
-    members, tournament schedule). Requires league manager. Cannot be undone.
+    members, tournament schedule, playoff config). Requires league manager. Cannot be undone.
 
     Deletes in FK-safe order because the DB constraints don't have ON DELETE CASCADE:
-    picks → seasons → league_members → league_tournaments → league.
+    picks → playoff_configs (cascades rounds/pods) → seasons → league_members → league_tournaments → league.
     """
     league, _ = league_and_manager
 
     db.query(Pick).filter_by(league_id=league.id).delete()
+    # PlayoffConfig ORM cascade deletes rounds → pods → members/picks/preferences
+    for config in db.query(PlayoffConfig).filter_by(league_id=league.id).all():
+        db.delete(config)
+    db.flush()
     db.query(Season).filter_by(league_id=league.id).delete()
     db.query(LeagueMember).filter_by(league_id=league.id).delete()
     db.query(LeagueTournament).filter_by(league_id=league.id).delete()
@@ -524,21 +530,66 @@ def update_league_tournaments(
     """
     Atomically replace the league's tournament schedule.
 
-    Accepts a full list of {tournament_id, multiplier} objects. Multiplier
-    may be null to inherit the tournament's global default. Existing rows not
-    in the new list are deleted; new rows are inserted. Returns the updated
-    sorted schedule.
+    Accepts a full list of {tournament_id, multiplier} objects.
+    Multiplier may be null to inherit the tournament's global default.
+
+    Validation: if the league has a pending playoff config, the new schedule
+    must include enough future (scheduled) tournaments to fill the bracket.
+    Playoff rounds are automatically the last N scheduled tournaments in the
+    schedule — no explicit per-tournament flag required.
+
+    All completed tournaments are re-scored after save.
+
     Requires league manager.
     """
     league, _ = league_and_manager
 
     tournament_ids = [item.tournament_id for item in body.tournaments]
 
-    # Verify all requested tournament IDs actually exist.
+    # Verify all requested tournament IDs actually exist; build lookup dict.
+    tournament_map: dict = {}
     if tournament_ids:
-        found = db.query(Tournament).filter(Tournament.id.in_(tournament_ids)).count()
-        if found != len(tournament_ids):
+        rows = db.query(Tournament).filter(Tournament.id.in_(tournament_ids)).all()
+        if len(rows) != len(tournament_ids):
             raise HTTPException(status_code=422, detail="One or more tournament IDs not found")
+        tournament_map = {t.id: t for t in rows}
+
+    # If a pending playoff config exists, ensure the new schedule has enough
+    # eligible future tournaments (scheduled, not the current week's tournament).
+    playoff_config = (
+        db.query(PlayoffConfig)
+        .join(Season, PlayoffConfig.season_id == Season.id)
+        .filter(PlayoffConfig.league_id == league.id, Season.is_active.is_(True))
+        .first()
+    )
+    if playoff_config and playoff_config.status == "pending" and playoff_config.playoff_size > 0:
+        if playoff_config.playoff_size == 32:
+            required = 4
+        else:
+            required = int(math.log2(playoff_config.playoff_size))
+
+        next_upcoming = (
+            db.query(Tournament)
+            .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+            .order_by(Tournament.start_date.asc())
+            .first()
+        )
+        next_upcoming_id = next_upcoming.id if next_upcoming else None
+
+        eligible = sum(
+            1 for item in body.tournaments
+            if tournament_map.get(item.tournament_id)
+            and tournament_map[item.tournament_id].status == TournamentStatus.SCHEDULED.value
+            and tournament_map[item.tournament_id].id != next_upcoming_id
+        )
+        if eligible < required:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Schedule must include at least {required} future tournament(s) for the "
+                    f"{playoff_config.playoff_size}-player playoff bracket (found {eligible})"
+                ),
+            )
 
     # Atomic replace: delete all existing selections, insert new ones.
     db.query(LeagueTournament).filter_by(league_id=league.id).delete()
@@ -550,12 +601,10 @@ def update_league_tournaments(
         ))
     db.commit()
 
-    # Re-score picks for every completed tournament in the new schedule.
-    # Always re-score (not just on multiplier change) so stale points_earned
-    # values from before multipliers were set get corrected automatically.
+    # Re-score all completed tournament picks.
     # score_picks uses cached TournamentEntry.earnings_usd — no ESPN API calls.
     for item in body.tournaments:
-        tournament = db.query(Tournament).filter_by(id=item.tournament_id).first()
+        tournament = tournament_map.get(item.tournament_id)
         if tournament and tournament.status == TournamentStatus.COMPLETED.value:
             score_picks(db, tournament)
 

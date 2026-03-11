@@ -1,30 +1,29 @@
 """
 Seed script for local development.
 
-Creates a realistic set of sample data so you have something to work with
-when building and testing the API and frontend. Safe to run multiple times —
-it checks for existing data before inserting.
+Creates realistic sample data using real PGA Tour tournament history that
+already exists in the database (scraped data). Safe to re-run — checks for
+existing data before inserting.
 
 Usage:
     cd fantasy-golf-backend
     python scripts/seed.py
 
 What gets created:
-  - 4 users (1 platform admin, 1 league admin, 2 regular members)
-  - 1 league ("Augusta Pines Fantasy Golf")
+  - 5 users: Blake (you, manager), Bob, Carol, Dave, Eve
+  - 1 league: "Augusta Pines Fantasy Golf"
   - 1 active season (current year)
-  - 8 golfers (mix of top-ranked players)
-  - 3 tournaments: 1 completed regular, 1 completed major, 1 upcoming
-  - Tournament entries linking golfers to tournaments
-  - Picks for the completed tournaments (with points already calculated)
+  - League schedule: last 8 completed tournaments + THE PLAYERS Championship
+  - Picks for each member across the 8 completed tournaments (real earnings)
+  - No pick for Eve in week 1 (tests no-pick penalty)
+
+Picks use actual golfer earnings from TournamentEntry — no made-up numbers.
 """
 
 import sys
 import os
-from datetime import date, datetime, timezone, timedelta
+from datetime import date
 
-# Add the project root to sys.path so `from app.xxx import ...` works when
-# running this script directly (not as a module).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bcrypt
@@ -35,6 +34,7 @@ from app.models import (
     League,
     LeagueMember,
     LeagueMemberRole,
+    LeagueMemberStatus,
     Pick,
     Season,
     Tournament,
@@ -42,255 +42,250 @@ from app.models import (
     TournamentStatus,
     User,
 )
+from app.models.league_tournament import LeagueTournament
 
 
 def hash_password(password: str) -> str:
-    """Hash a password with bcrypt. Returns a UTF-8 string suitable for storing in the DB."""
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def get_or_create_user(db, email: str, display_name: str, is_platform_admin: bool = False) -> User:
+    """Return existing user or create a new one with password123."""
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        user = User(
+            email=email,
+            password_hash=hash_password("password123"),
+            display_name=display_name,
+            is_platform_admin=is_platform_admin,
+        )
+        db.add(user)
+        db.flush()
+        print(f"  Created user: {email}")
+    else:
+        print(f"  Found existing user: {email}")
+    return user
+
+
+def get_earnings(db, tournament_id, golfer_id) -> float | None:
+    """Look up real earnings from TournamentEntry."""
+    entry = db.query(TournamentEntry).filter_by(
+        tournament_id=tournament_id, golfer_id=golfer_id
+    ).first()
+    return entry.earnings_usd if entry else None
 
 
 def seed():
     db = SessionLocal()
     try:
         # ---------------------------------------------------------------
-        # Users
+        # Idempotency check
         # ---------------------------------------------------------------
-        # Check if we've already seeded to make this idempotent.
-        if db.query(User).filter_by(email="admin@example.com").first():
-            print("Seed data already exists. Skipping.")
+        if db.query(League).filter_by(name="Augusta Pines Fantasy Golf").first():
+            print("Augusta Pines league already exists. Skipping.")
             return
 
-        print("Creating users...")
-
-        # Platform admin — can trigger scraper syncs, manage all tournaments.
-        admin = User(
-            email="admin@example.com",
-            password_hash=hash_password("password123"),
-            display_name="Platform Admin",
-            is_platform_admin=True,
-        )
-
-        # League admin — created the league, manages its members.
-        alice = User(
-            email="alice@example.com",
-            password_hash=hash_password("password123"),
-            display_name="Alice Chen",
-        )
-
-        # Regular members.
-        bob = User(
-            email="bob@example.com",
-            password_hash=hash_password("password123"),
-            display_name="Bob Martinez",
-        )
-        carol = User(
-            email="carol@example.com",
-            password_hash=hash_password("password123"),
-            display_name="Carol Johnson",
-        )
-
-        db.add_all([admin, alice, bob, carol])
-        db.flush()  # Flush to get generated UUIDs without committing yet.
+        # ---------------------------------------------------------------
+        # Users
+        # ---------------------------------------------------------------
+        print("\nUsers:")
+        # Blake is you — use existing Google OAuth account if present
+        blake = get_or_create_user(db, "chambersbw@gmail.com", "Blake Chambers")
+        bob   = get_or_create_user(db, "bob@example.com",   "Bob Martinez")
+        carol = get_or_create_user(db, "carol@example.com", "Carol Johnson")
+        dave  = get_or_create_user(db, "dave@example.com",  "Dave Thompson")
+        eve   = get_or_create_user(db, "eve@example.com",   "Eve Wilson")
+        _     = get_or_create_user(db, "admin@example.com", "Platform Admin", is_platform_admin=True)
 
         # ---------------------------------------------------------------
         # League
         # ---------------------------------------------------------------
-        print("Creating league...")
-
+        print("\nLeague:")
         league = League(
             name="Augusta Pines Fantasy Golf",
-            description="A friendly fantasy golf league for friends and colleagues.",
-            created_by=alice.id,
+            description="A friendly fantasy golf league for testing.",
+            created_by=blake.id,
             no_pick_penalty=-50_000,
         )
         db.add(league)
         db.flush()
+        print(f"  Created: {league.name} (id: {league.id})")
 
-        # Add all four users as members; Alice is league manager.
-        memberships = [
-            LeagueMember(league_id=league.id, user_id=alice.id, role=LeagueMemberRole.MANAGER.value),
-            LeagueMember(league_id=league.id, user_id=bob.id, role=LeagueMemberRole.MEMBER.value),
-            LeagueMember(league_id=league.id, user_id=carol.id, role=LeagueMemberRole.MEMBER.value),
-            LeagueMember(league_id=league.id, user_id=admin.id, role=LeagueMemberRole.MEMBER.value),
+        members = [
+            LeagueMember(league_id=league.id, user_id=blake.id, role=LeagueMemberRole.MANAGER.value, status=LeagueMemberStatus.APPROVED.value),
+            LeagueMember(league_id=league.id, user_id=bob.id,   role=LeagueMemberRole.MEMBER.value,  status=LeagueMemberStatus.APPROVED.value),
+            LeagueMember(league_id=league.id, user_id=carol.id, role=LeagueMemberRole.MEMBER.value,  status=LeagueMemberStatus.APPROVED.value),
+            LeagueMember(league_id=league.id, user_id=dave.id,  role=LeagueMemberRole.MEMBER.value,  status=LeagueMemberStatus.APPROVED.value),
+            LeagueMember(league_id=league.id, user_id=eve.id,   role=LeagueMemberRole.MEMBER.value,  status=LeagueMemberStatus.APPROVED.value),
         ]
-        db.add_all(memberships)
+        db.add_all(members)
 
         # ---------------------------------------------------------------
         # Season
         # ---------------------------------------------------------------
-        print("Creating season...")
-
-        current_year = date.today().year
-        season = Season(league_id=league.id, year=current_year, is_active=True)
+        season = Season(league_id=league.id, year=date.today().year, is_active=True)
         db.add(season)
         db.flush()
 
         # ---------------------------------------------------------------
-        # Golfers
+        # Tournaments — look up by PGA Tour ID (scraped data)
         # ---------------------------------------------------------------
-        print("Creating golfers...")
-
-        golfers_data = [
-            {"pga_tour_id": "34046", "name": "Scottie Scheffler",  "world_ranking": 1,  "country": "US"},
-            {"pga_tour_id": "46046", "name": "Rory McIlroy",       "world_ranking": 2,  "country": "NIR"},
-            {"pga_tour_id": "29478", "name": "Xander Schauffele",  "world_ranking": 3,  "country": "US"},
-            {"pga_tour_id": "47959", "name": "Collin Morikawa",    "world_ranking": 4,  "country": "US"},
-            {"pga_tour_id": "48081", "name": "Viktor Hovland",     "world_ranking": 5,  "country": "NOR"},
-            {"pga_tour_id": "33948", "name": "Jon Rahm",           "world_ranking": 6,  "country": "ESP"},
-            {"pga_tour_id": "27644", "name": "Brooks Koepka",      "world_ranking": 7,  "country": "US"},
-            {"pga_tour_id": "30925", "name": "Bryson DeChambeau",  "world_ranking": 8,  "country": "US"},
+        print("\nTournaments:")
+        # PGA Tour IDs for the 8 most recent completed events + THE PLAYERS
+        pga_ids = [
+            "401811929",  # The American Express        (2026-01-22)
+            "401811930",  # Sony Open in Hawaii          (2026-01-15) -- skip, use below
+            "401811931",  # Farmers Insurance Open       (2026-01-29)
+            "401811932",  # WM Phoenix Open              (2026-02-05)
+            "401811933",  # AT&T Pebble Beach Pro-Am     (2026-02-12)
+            "401811934",  # The Genesis Invitational     (2026-02-19)
+            "401811935",  # Cognizant Classic            (2026-02-26)
+            "401811936",  # Arnold Palmer Invitational   (2026-03-05)
+            "401811937",  # THE PLAYERS Championship     (2026-03-12) ← playoff week
         ]
 
-        golfers = []
-        for g in golfers_data:
-            golfer = Golfer(**g)
-            db.add(golfer)
-            golfers.append(golfer)
-        db.flush()
-
-        # ---------------------------------------------------------------
-        # Tournaments
-        # ---------------------------------------------------------------
-        print("Creating tournaments...")
-
-        # A completed regular tournament (2 weeks ago).
-        t1_start = date.today() - timedelta(weeks=2)
-        tournament_regular = Tournament(
-            pga_tour_id="R2025001",
-            name="The Sentry",
-            start_date=t1_start,
-            end_date=t1_start + timedelta(days=3),
-            multiplier=1.0,
-            purse_usd=20_000_000,
-            status=TournamentStatus.COMPLETED.value,
-        )
-
-        # A completed major tournament (1 week ago). Points are doubled.
-        t2_start = date.today() - timedelta(weeks=1)
-        tournament_major = Tournament(
-            pga_tour_id="R2025002",
-            name="The Masters",
-            start_date=t2_start,
-            end_date=t2_start + timedelta(days=3),
-            multiplier=2.0,
-            purse_usd=18_000_000,
-            status=TournamentStatus.COMPLETED.value,
-        )
-
-        # An upcoming tournament (next week). No picks yet.
-        t3_start = date.today() + timedelta(weeks=1)
-        tournament_upcoming = Tournament(
-            pga_tour_id="R2025003",
-            name="AT&T Pebble Beach Pro-Am",
-            start_date=t3_start,
-            end_date=t3_start + timedelta(days=3),
-            multiplier=1.0,
-            purse_usd=8_700_000,
-            status=TournamentStatus.SCHEDULED.value,
-        )
-
-        db.add_all([tournament_regular, tournament_major, tournament_upcoming])
-        db.flush()
-
-        # ---------------------------------------------------------------
-        # Tournament entries (golfers in each tournament)
-        # ---------------------------------------------------------------
-        print("Creating tournament entries...")
-
-        # Regular tournament results: top 4 finishers with earnings.
-        regular_results = [
-            # (golfer_index, finish_position, earnings_usd)
-            (0, 1, 3_600_000),  # Scheffler wins
-            (1, 2, 2_160_000),  # McIlroy 2nd
-            (2, 3, 1_360_000),  # Schauffele 3rd
-            (3, 4,   960_000),  # Morikawa 4th
-            (4, None, None),    # Hovland — missed cut
-            (5, None, None),    # Rahm — missed cut
-            (6, None, None),    # Koepka — WD
-            (7, None, None),    # DeChambeau — missed cut
+        # Resolve by name instead since we confirmed these names exist
+        tournament_names = [
+            "The American Express",
+            "Farmers Insurance Open",
+            "WM Phoenix Open",
+            "AT&T Pebble Beach Pro-Am",
+            "The Genesis Invitational",
+            "Cognizant Classic in The Palm Beaches",
+            "Arnold Palmer Invitational pres. by Mastercard",
+            "THE PLAYERS Championship",
         ]
-        for golfer_idx, position, earnings in regular_results:
-            entry = TournamentEntry(
-                tournament_id=tournament_regular.id,
-                golfer_id=golfers[golfer_idx].id,
-                finish_position=position,
-                earnings_usd=earnings,
-                status="cut" if earnings is None else None,
-            )
-            db.add(entry)
 
-        # Major tournament results: different winner for variety.
-        major_results = [
-            (1, 1, 3_240_000),  # McIlroy wins the Masters
-            (0, 2, 1_944_000),  # Scheffler 2nd
-            (3, 3, 1_224_000),  # Morikawa 3rd
-            (5, 4,   864_000),  # Rahm 4th
-            (2, None, None),
-            (4, None, None),
-            (6, None, None),
-            (7, None, None),
-        ]
-        for golfer_idx, position, earnings in major_results:
-            entry = TournamentEntry(
-                tournament_id=tournament_major.id,
-                golfer_id=golfers[golfer_idx].id,
-                finish_position=position,
-                earnings_usd=earnings,
-                status="cut" if earnings is None else None,
-            )
-            db.add(entry)
-
-        # Upcoming tournament: field announced, no results yet.
-        for golfer in golfers:
-            entry = TournamentEntry(
-                tournament_id=tournament_upcoming.id,
-                golfer_id=golfer.id,
-                # tee_time would be set by the scraper later
-            )
-            db.add(entry)
+        tournaments: dict[str, Tournament] = {}
+        for name in tournament_names:
+            t = db.query(Tournament).filter(Tournament.name.ilike(f"%{name.split(' ')[0]}%{name.split(' ')[-1]}%")).first()
+            if not t:
+                # Try exact name prefix
+                t = db.query(Tournament).filter(Tournament.name.ilike(f"{name[:20]}%")).first()
+            if t:
+                tournaments[name] = t
+                db.add(LeagueTournament(league_id=league.id, tournament_id=t.id))
+                print(f"  Scheduled: {t.name} ({t.start_date}, status={t.status})")
+            else:
+                print(f"  WARNING: Not found: {name}")
 
         db.flush()
 
         # ---------------------------------------------------------------
-        # Picks
+        # Golfers — resolve by name from DB
         # ---------------------------------------------------------------
-        # Each user picks a different golfer for each completed tournament.
-        # points_earned = earnings_usd * tournament.multiplier
-        print("Creating picks...")
+        def golfer(name: str) -> Golfer:
+            g = db.query(Golfer).filter_by(name=name).first()
+            if not g:
+                raise ValueError(f"Golfer not found: {name}")
+            return g
 
-        picks_data = [
-            # (user, tournament, golfer_idx, earnings, multiplier)
-            (alice, tournament_regular, 0, 3_600_000, 1.0),   # Alice picked Scheffler (winner)
-            (bob,   tournament_regular, 2,   960_000, 1.0),   # Bob picked Schauffele (wrong — actually 3rd, using Morikawa's earnings)
-            (carol, tournament_regular, 1, 2_160_000, 1.0),   # Carol picked McIlroy (2nd)
+        scheffler  = golfer("Scottie Scheffler")
+        mcilroy    = golfer("Rory McIlroy")
+        morikawa   = golfer("Collin Morikawa")
+        bhatia     = golfer("Akshay Bhatia")
+        aberg      = golfer("Ludvig Åberg")
+        bridgeman  = golfer("Jacob Bridgeman")
+        rose       = golfer("Justin Rose")
+        gotterup   = golfer("Chris Gotterup")
+        matsuyama  = golfer("Hideki Matsuyama")
+        echavarria = golfer("Nico Echavarria")
+        minwoo     = golfer("Min Woo Lee")
+        straka     = golfer("Sepp Straka")
+        jason_day  = golfer("Jason Day")
+        si_woo     = golfer("Si Woo Kim")
+        lowry      = golfer("Shane Lowry")
+        berger     = golfer("Daniel Berger")
+        castillo   = golfer("Ricky Castillo")
+        mccarty    = golfer("Matt McCarty")
+        coody      = golfer("Pierceson Coody")
+        fleetwood  = golfer("Tommy Fleetwood")
+        kitayama   = golfer("Kurt Kitayama")
+        t_moore    = golfer("Taylor Moore")
+        blanchet   = golfer("Chandler Blanchet")
+        gerard     = golfer("Ryan Gerard")
+        hisatsune  = golfer("Ryo Hisatsune")
+        cam_young  = golfer("Cameron Young")
+        adam_scott = golfer("Adam Scott")
+        clanton    = golfer("Luke Clanton")
 
-            (alice, tournament_major,   1, 3_240_000, 2.0),   # Alice picked McIlroy (winner) — doubled!
-            (bob,   tournament_major,   0, 1_944_000, 2.0),   # Bob picked Scheffler (2nd) — doubled
-            (carol, tournament_major,   3, 1_224_000, 2.0),   # Carol picked Morikawa (3rd) — doubled
-        ]
-        for user, tournament, golfer_idx, earnings, multiplier in picks_data:
+        # ---------------------------------------------------------------
+        # Picks — (user, tournament_name, golfer) — earnings from real DB
+        # No-repeat rule respected per user.
+        # ---------------------------------------------------------------
+        print("\nPicks:")
+
+        def make_pick(user, t_name, golfer_obj):
+            t = tournaments.get(t_name)
+            if not t:
+                print(f"  SKIP pick (tournament not found): {t_name}")
+                return
+            earnings = get_earnings(db, t.id, golfer_obj.id)
+            pts = (earnings or 0) * t.multiplier
             pick = Pick(
                 league_id=league.id,
                 season_id=season.id,
                 user_id=user.id,
-                tournament_id=tournament.id,
-                golfer_id=golfers[golfer_idx].id,
-                points_earned=earnings * multiplier,
+                tournament_id=t.id,
+                golfer_id=golfer_obj.id,
+                points_earned=pts,
+                # earnings_usd is a hybrid property derived from TournamentEntry — not set directly
             )
             db.add(pick)
 
-        # Carol missed the first regular tournament — no pick row.
-        # This means she'll receive the no_pick_penalty (-50,000) for that week
-        # when standings are calculated.
+        # Blake — strong season, picked mostly winners
+        make_pick(blake, "The American Express",                          scheffler)   # W  $1,656,000
+        make_pick(blake, "Farmers Insurance Open",                        rose)        # W  $1,728,000
+        make_pick(blake, "WM Phoenix Open",                               matsuyama)   # 2  $1,046,400
+        make_pick(blake, "AT&T Pebble Beach Pro-Am",                      morikawa)    # W  $3,600,000
+        make_pick(blake, "The Genesis Invitational",                      mcilroy)     # T2 $1,800,000
+        make_pick(blake, "Cognizant Classic in The Palm Beaches",         echavarria)  # W  $1,728,000
+        make_pick(blake, "Arnold Palmer Invitational pres. by Mastercard",bhatia)      # W  $4,000,000
+        # Puerto Rico — Blake skips (no pick)
+
+        # Bob — solid, a few misses
+        make_pick(bob, "The American Express",                          jason_day)   # T2 $616,400
+        make_pick(bob, "Farmers Insurance Open",                        si_woo)      # T2 $726,400
+        make_pick(bob, "WM Phoenix Open",                               gotterup)    # W  $1,728,000
+        make_pick(bob, "AT&T Pebble Beach Pro-Am",                      straka)      # T2 $1,760,000
+        make_pick(bob, "The Genesis Invitational",                      bridgeman)   # W  $4,000,000
+        make_pick(bob, "Cognizant Classic in The Palm Beaches",         lowry)       # T2 $726,400
+        make_pick(bob, "Arnold Palmer Invitational pres. by Mastercard",berger)      # 2  $2,200,000
+
+        # Carol — mixed results
+        make_pick(carol, "The American Express",                          mccarty)     # T2 $616,400
+        make_pick(carol, "Farmers Insurance Open",                        coody)       # T2 $726,400
+        make_pick(carol, "WM Phoenix Open",                               scheffler)   # T3 $439,680
+        make_pick(carol, "AT&T Pebble Beach Pro-Am",                      fleetwood)   # T4 $877,500
+        make_pick(carol, "The Genesis Invitational",                      kitayama)    # T2 $1,800,000
+        make_pick(carol, "Cognizant Classic in The Palm Beaches",         t_moore)     # T2 $726,400
+        make_pick(carol, "Arnold Palmer Invitational pres. by Mastercard",aberg)       # T3 $1,200,000
+
+        # Dave — trailing the pack
+        make_pick(dave, "The American Express",                          gerard)      # T2 $616,400
+        make_pick(dave, "Farmers Insurance Open",                        hisatsune)   # T2 $726,400
+        make_pick(dave, "WM Phoenix Open",                               bhatia)      # T3 $439,680
+        make_pick(dave, "AT&T Pebble Beach Pro-Am",                      scheffler)   # T4 $877,500
+        make_pick(dave, "The Genesis Invitational",                      adam_scott)  # 4  $1,000,000
+        make_pick(dave, "Cognizant Classic in The Palm Beaches",         echavarria)  # W  $1,728,000
+        make_pick(dave, "Arnold Palmer Invitational pres. by Mastercard",cam_young)   # 3  $1,200,000
+
+        # Eve — no-pick penalty in week 1, otherwise decent
+        # (no pick for The American Express — triggers no_pick_penalty)
+        make_pick(eve, "Farmers Insurance Open",                        rose)        # W  $1,728,000  (same as Blake, different week is fine — different user)
+        make_pick(eve, "WM Phoenix Open",                               si_woo)      # T3 $439,680
+        make_pick(eve, "AT&T Pebble Beach Pro-Am",                      minwoo)      # T2 $1,760,000
+        make_pick(eve, "The Genesis Invitational",                      mcilroy)     # T2 $1,800,000
+        make_pick(eve, "Cognizant Classic in The Palm Beaches",         blanchet)    # T2 $726,400  (Smotherman?)
+        make_pick(eve, "Arnold Palmer Invitational pres. by Mastercard",berger)      # 2  $2,200,000
 
         db.commit()
-        print("\nSeed complete!")
-        print(f"  League:      '{league.name}' (id: {league.id})")
-        print(f"  Season:      {current_year}")
-        print(f"  Users:       alice@example.com (league manager), bob@example.com, carol@example.com")
-        print(f"  Password:    password123 (all users)")
-        print(f"  Tournaments: {tournament_regular.name}, {tournament_major.name}, {tournament_upcoming.name}")
-        print(f"  Golfers:     {len(golfers)} golfers seeded")
+        print(f"\nSeed complete!")
+        print(f"  League id:   {league.id}")
+        print(f"  Season:      {season.year}")
+        print(f"  Members:     chambersbw@gmail.com (manager), bob, carol, dave, eve")
+        print(f"  Passwords:   password123 (all except chambersbw if already OAuth)")
+        print(f"  Tournaments: {len(tournaments)} in schedule")
 
     except Exception as e:
         db.rollback()

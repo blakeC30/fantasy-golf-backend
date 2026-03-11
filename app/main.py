@@ -18,7 +18,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
 from app.limiter import limiter
-from app.routers import admin, auth, golfers, leagues, picks, standings, tournaments, users
+from app.routers import admin, auth, golfers, leagues, picks, playoff, standings, tournaments, users
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,7 @@ app.include_router(golfers.router, prefix=_PREFIX)
 app.include_router(picks.router, prefix=_PREFIX)
 app.include_router(standings.router, prefix=_PREFIX)
 app.include_router(admin.router, prefix=_PREFIX)
+app.include_router(playoff.router, prefix=_PREFIX)
 
 
 @app.get("/health")

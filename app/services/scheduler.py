@@ -217,6 +217,13 @@ def _run_live_score_sync() -> None:
 
     No day-of-week restriction — if a tournament is in_progress on Monday
     due to a weather delay or playoff carryover, this job continues running.
+
+    Safety guard: if a tournament's end_date is more than 3 days in the past
+    but its status is still in_progress, it means ESPN hasn't reported
+    STATUS_FINAL yet (or schedule_sync encountered an error). We skip it and
+    log a warning. The next daily schedule_sync will correct the status once
+    ESPN updates. 3 days gives enough buffer for Monday playoff holes and
+    Tuesday weather-delay finishes.
     """
     from app.database import SessionLocal
     from app.models import Tournament, TournamentStatus
@@ -232,7 +239,20 @@ def _run_live_score_sync() -> None:
         if not active_tournaments:
             return  # Nothing to do — skip silently (fires every 10 min)
 
+        today_utc = datetime.now(tz=timezone.utc).date()
+
         for tournament in active_tournaments:
+            # Safety guard: skip tournaments whose end_date is stale.
+            if tournament.end_date and (today_utc - tournament.end_date).days > 3:
+                log.warning(
+                    "Live sync: skipping '%s' — end_date %s is %d days ago but status is "
+                    "still in_progress. schedule_sync will correct once ESPN updates.",
+                    tournament.name,
+                    tournament.end_date,
+                    (today_utc - tournament.end_date).days,
+                )
+                continue
+
             if not _is_within_play_window(db, tournament):
                 log.debug("Live sync: outside play window for '%s', skipping", tournament.name)
                 continue

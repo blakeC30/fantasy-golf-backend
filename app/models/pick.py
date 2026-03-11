@@ -112,6 +112,11 @@ class Pick(Base):
         return self.entry.finish_position if self.entry is not None else None
 
     @property
+    def golfer_status(self) -> str | None:
+        """Golfer's status in the tournament (e.g. 'CUT', 'WD', 'DQ'); None if active/finished normally."""
+        return self.entry.status if self.entry is not None else None
+
+    @property
     def is_tied(self) -> bool:
         """True when multiple golfers share this finish position."""
         return bool(self.entry and self.entry.is_tied)

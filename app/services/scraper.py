@@ -789,6 +789,16 @@ def parse_schedule_response(data: dict) -> list[dict]:
             "multiplier": 1.0,
         })
 
+    # The Tour Championship (final FedEx Cup Playoffs event) is the last valid
+    # fantasy-season event. Drop any tournaments that start after it ends.
+    tour_champ = next(
+        (r for r in results if "tour championship" in r["name"].lower()),
+        None,
+    )
+    if tour_champ:
+        cutoff = tour_champ["end_date"]
+        results = [r for r in results if r["start_date"] <= cutoff]
+
     return results
 
 
@@ -1158,6 +1168,51 @@ def _backfill_field_earnings(db: Session, tournament: Tournament) -> None:
 # High-level sync functions (HTTP + DB)
 # ---------------------------------------------------------------------------
 
+def _trim_post_championship_tournaments(db: Session) -> int:
+    """
+    Delete any Tournament rows that start after the Tour Championship ends.
+
+    Run after every schedule sync to remove rows that may have been inserted
+    before this cutoff rule existed. Safely skips any tournament that still has
+    picks or league_tournament associations (those must be cleaned up manually).
+    """
+    tour_champ = (
+        db.query(Tournament)
+        .filter(Tournament.name.ilike("%tour championship%"))
+        .order_by(Tournament.start_date.desc())
+        .first()
+    )
+    if not tour_champ:
+        return 0
+
+    after_cutoff = (
+        db.query(Tournament)
+        .filter(Tournament.start_date > tour_champ.end_date)
+        .all()
+    )
+    deleted = 0
+    for t in after_cutoff:
+        has_deps = (
+            db.query(LeagueTournament).filter_by(tournament_id=t.id).first()
+            or db.query(Pick).filter_by(tournament_id=t.id).first()
+        )
+        if has_deps:
+            log.warning(
+                "Skipping deletion of post-championship tournament '%s' — has active dependencies",
+                t.name,
+            )
+            continue
+        for entry in db.query(TournamentEntry).filter_by(tournament_id=t.id).all():
+            db.delete(entry)
+        db.delete(t)
+        deleted += 1
+
+    if deleted:
+        db.commit()
+        log.info("Trimmed %d post-Tour-Championship tournament(s)", deleted)
+    return deleted
+
+
 def sync_schedule(db: Session, year: int) -> dict:
     """
     Fetch the PGA Tour schedule for a calendar year and upsert tournaments.
@@ -1173,8 +1228,11 @@ def sync_schedule(db: Session, year: int) -> dict:
     parsed = parse_schedule_response(data)
     created, updated = upsert_tournaments(db, parsed)
 
-    log.info("Schedule sync: %d created, %d updated", created, updated)
-    return {"year": year, "tournaments_created": created, "tournaments_updated": updated}
+    # Remove any rows that somehow slipped in past the Tour Championship cutoff.
+    trimmed = _trim_post_championship_tournaments(db)
+
+    log.info("Schedule sync: %d created, %d updated, %d trimmed", created, updated, trimmed)
+    return {"year": year, "tournaments_created": created, "tournaments_updated": updated, "tournaments_trimmed": trimmed}
 
 
 def sync_tournament(db: Session, pga_tour_id: str, *, force: bool = False) -> dict:

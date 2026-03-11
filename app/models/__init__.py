@@ -12,6 +12,7 @@ from app.models.golfer import Golfer
 from app.models.tournament import Tournament, TournamentEntry, TournamentEntryRound, TournamentStatus
 from app.models.pick import Pick
 from app.models.league_tournament import LeagueTournament
+from app.models.playoff import PlayoffConfig, PlayoffRound, PlayoffPod, PlayoffPodMember, PlayoffPick, PlayoffDraftPreference
 
 __all__ = [
     "Base",
@@ -28,4 +29,10 @@ __all__ = [
     "TournamentStatus",
     "Pick",
     "LeagueTournament",
+    "PlayoffConfig",
+    "PlayoffRound",
+    "PlayoffPod",
+    "PlayoffPodMember",
+    "PlayoffPick",
+    "PlayoffDraftPreference",
 ]

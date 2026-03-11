@@ -12,9 +12,11 @@ Endpoints:
 
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import and_, func as sqlfunc, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -34,11 +36,12 @@ from app.models import (
     Season,
     Tournament,
     TournamentEntry,
+    TournamentEntryRound,
     TournamentStatus,
     User,
 )
 from app.schemas.pick import PickCreate, PickOut, PickUpdate
-from app.services.picks import validate_new_pick, validate_pick_change
+from app.services.picks import all_r1_teed_off as _all_r1_teed_off, validate_new_pick, validate_pick_change
 from app.services.scraper import score_picks
 
 
@@ -168,10 +171,14 @@ def get_all_picks(
     db: Session = Depends(get_db),
 ):
     """
-    Return all picks for completed tournaments in the active season.
+    Return all picks for the active season that are safe to reveal.
 
-    Picks for in-progress or upcoming tournaments are withheld to prevent
-    members from copying each other's choices.
+    A tournament's picks are revealed when:
+      - The tournament is COMPLETED, OR
+      - The tournament is IN_PROGRESS AND all Round 1 tee times have passed
+        (i.e. every golfer in the field has teed off and no one can copy picks).
+
+    Picks for SCHEDULED tournaments are always withheld.
     """
     league, _ = league_and_member
     scheduled_tournament_ids = (
@@ -179,14 +186,35 @@ def get_all_picks(
         .filter_by(league_id=league.id)
         .scalar_subquery()
     )
+    now_utc = datetime.now(tz=timezone.utc)
+
+    # Subquery: tournament IDs where the last Round 1 tee time has already passed.
+    all_teed_off_sq = (
+        db.query(TournamentEntry.tournament_id)
+        .join(TournamentEntryRound, TournamentEntryRound.tournament_entry_id == TournamentEntry.id)
+        .filter(
+            TournamentEntryRound.round_number == 1,
+            TournamentEntryRound.tee_time.isnot(None),
+        )
+        .group_by(TournamentEntry.tournament_id)
+        .having(sqlfunc.max(TournamentEntryRound.tee_time) <= now_utc)
+        .subquery()
+    )
+
     return (
         _picks_with_relations(
             db.query(Pick)
             .filter_by(league_id=league.id, season_id=season.id)
             .join(Pick.tournament)
             .filter(
-                Tournament.status == TournamentStatus.COMPLETED.value,
                 Tournament.id.in_(scheduled_tournament_ids),
+                or_(
+                    Tournament.status == TournamentStatus.COMPLETED.value,
+                    and_(
+                        Tournament.status == TournamentStatus.IN_PROGRESS.value,
+                        Tournament.id.in_(all_teed_off_sq),
+                    ),
+                ),
             )
         )
         .all()
@@ -203,8 +231,9 @@ def get_tournament_picks_summary(
     Return pick breakdown for a specific tournament.
 
     Picks are hidden while status=scheduled to prevent copying before the
-    tournament begins. Once in_progress or completed, all member picks are
-    shown grouped by golfer, along with members who submitted no pick.
+    tournament begins. Once in_progress, picks are revealed only after all
+    Round 1 tee times have passed (everyone has teed off). Always visible
+    once completed.
     """
     league, _ = league_and_member
 
@@ -219,6 +248,8 @@ def get_tournament_picks_summary(
     tournament = lt.tournament
     if tournament.status == TournamentStatus.SCHEDULED.value:
         raise HTTPException(403, "Picks are revealed once the tournament begins")
+    if tournament.status == TournamentStatus.IN_PROGRESS.value and not _all_r1_teed_off(db, tournament.id):
+        raise HTTPException(403, "Picks are revealed once all golfers have teed off")
 
     picks = (
         db.query(Pick)

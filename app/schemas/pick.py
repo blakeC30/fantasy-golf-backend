@@ -30,6 +30,7 @@ class PickOut(BaseModel):
     is_locked: bool  # True once the golfer's Round 1 tee time has passed
     position: int | None  # from TournamentEntry; None if not yet scored
     is_tied: bool  # True when multiple golfers share this finish position
+    golfer_status: str | None  # e.g. "CUT", "WD", "DQ"; None if active/finished normally
     golfer: GolferOut
     tournament: TournamentOut
 

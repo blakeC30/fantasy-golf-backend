@@ -7,6 +7,8 @@ participate in. This handles two common scenarios:
   2. Mid-season start — tournaments before the league started are excluded.
 
 Picks and standings are scoped to a league's selected tournaments only.
+Playoff rounds are automatically determined as the last N scheduled tournaments
+in the league's schedule (N = required rounds for the configured playoff_size).
 """
 
 from datetime import datetime

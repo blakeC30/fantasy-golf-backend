@@ -23,9 +23,10 @@ import uuid
 from datetime import date, datetime, timezone
 
 from fastapi import HTTPException
+from sqlalchemy import func as sqlfunc
 from sqlalchemy.orm import Session
 
-from app.models import Golfer, LeagueTournament, Pick, Season, Tournament, TournamentEntry, TournamentStatus
+from app.models import Golfer, LeagueTournament, Pick, Season, Tournament, TournamentEntry, TournamentEntryRound, TournamentStatus
 
 
 def validate_new_pick(
@@ -204,3 +205,29 @@ def validate_pick_change(
             status_code=400,
             detail="You have already picked this golfer this season",
         )
+
+
+def all_r1_teed_off(db: Session, tournament_id) -> bool:
+    """
+    Return True if the last Round 1 tee time for the tournament is in the past.
+
+    Used to decide when other members' picks should become visible. If no Round 1
+    tee times are in the DB yet (field not synced), returns False so picks stay
+    hidden until data is available.
+    """
+    last_tee_time = (
+        db.query(sqlfunc.max(TournamentEntryRound.tee_time))
+        .join(TournamentEntry, TournamentEntryRound.tournament_entry_id == TournamentEntry.id)
+        .filter(
+            TournamentEntry.tournament_id == tournament_id,
+            TournamentEntryRound.round_number == 1,
+            TournamentEntryRound.tee_time.isnot(None),
+        )
+        .scalar()
+    )
+    if last_tee_time is None:
+        return False
+    now_utc = datetime.now(tz=timezone.utc)
+    if last_tee_time.tzinfo is None:
+        last_tee_time = last_tee_time.replace(tzinfo=timezone.utc)
+    return last_tee_time <= now_utc
