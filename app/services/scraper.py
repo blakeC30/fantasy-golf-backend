@@ -270,6 +270,23 @@ def _fetch_competitor_rounds(
         raw_pos = item.get("currentPosition")
         position: str | None = str(raw_pos) if raw_pos is not None else None
 
+        # Count completed holes from the nested linescores array.
+        # Only count holes with a real (non-zero) score — ESPN may include
+        # 0-value placeholders for holes not yet played.
+        # "thru" = 0 means the round is scheduled but not started; 18 = complete.
+        linescores = item.get("linescores", [])
+        played = [h for h in linescores if h.get("value") not in (None, 0, "0")]
+        thru: int | None = len(played) if linescores else None
+
+        # Detect back-nine starts: if the first played hole is >= 10 the golfer
+        # started on the back nine (displayed as e.g. "8*" on the leaderboard).
+        started_on_back: bool | None = None
+        if played:
+            try:
+                started_on_back = int(played[0].get("period")) >= 10
+            except (TypeError, ValueError):
+                pass
+
         rounds.append({
             "round_number": round_number,
             "tee_time": tee_time_utc,
@@ -277,6 +294,8 @@ def _fetch_competitor_rounds(
             "score_to_par": score_to_par,
             "position": position,
             "is_playoff": is_playoff,
+            "thru": thru,
+            "started_on_back": started_on_back,
         })
 
     return athlete_id, rounds
@@ -943,6 +962,11 @@ def upsert_field(
                     if rd.get("position") is not None:
                         round_row.position = rd["position"]
                     round_row.is_playoff = rd.get("is_playoff", False)
+                    # Always overwrite thru/started_on_back — they change every sync.
+                    if rd.get("thru") is not None:
+                        round_row.thru = rd["thru"]
+                    if rd.get("started_on_back") is not None:
+                        round_row.started_on_back = rd["started_on_back"]
                 else:
                     db.add(TournamentEntryRound(
                         tournament_entry_id=entry.id,
@@ -952,6 +976,8 @@ def upsert_field(
                         score_to_par=rd.get("score_to_par"),
                         position=rd.get("position"),
                         is_playoff=rd.get("is_playoff", False),
+                        thru=rd.get("thru"),
+                        started_on_back=rd.get("started_on_back"),
                     ))
 
         entry_by_pga_id[g["pga_tour_id"]] = entry
@@ -1437,6 +1463,24 @@ def fetch_golfer_scorecard(
     total_score: int | None = None
     total_score_to_par: int | None = None
 
+    # First pass: collect hole→par from ALL rounds in the response.
+    # Par is a fixed course property — any round that has hole data gives us the par for each hole,
+    # which we can reuse to populate par for holes not yet played in the current round.
+    # Use int() with fallback so we always have integer keys regardless of what ESPN sends.
+    hole_pars: dict[int, int] = {}
+    for item in data.get("items", []):
+        for hole_item in item.get("linescores", []):
+            try:
+                h = int(hole_item.get("period"))
+                p = int(hole_item.get("par"))
+                if h not in hole_pars:
+                    hole_pars[h] = p
+            except (TypeError, ValueError):
+                pass
+
+    # Second pass: process the requested round.
+    # Keep the original simple append-per-hole approach (do NOT convert types here —
+    # ESPN may return period/value as strings, and the frontend normalises with Number()).
     for item in data.get("items", []):
         if item.get("period") != round_number:
             continue
@@ -1449,7 +1493,7 @@ def fetch_golfer_scorecard(
         except (ValueError, AttributeError):
             total_score_to_par = None
 
-        # Hole-level linescores (nested under the round item)
+        # Hole-level linescores — store exactly as ESPN sends them.
         for hole_item in item.get("linescores", []):
             hole_num = hole_item.get("period")
             score = hole_item.get("value")
@@ -1469,15 +1513,28 @@ def fetch_golfer_scorecard(
                     result = "double_bogey"
                 else:
                     result = "triple_plus"
-            holes.append(
-                {
-                    "hole": hole_num,
-                    "par": par,
-                    "score": score,
-                    "score_to_par": stp,
-                    "result": result,
-                }
-            )
+            holes.append({
+                "hole": hole_num,
+                "par": par,
+                "score": score,
+                "score_to_par": stp,
+                "result": result,
+            })
+
+        # Post-process: for standard rounds (1–4), add any holes that ESPN omitted
+        # (i.e. not yet played) using the par data collected in the first pass.
+        if round_number <= 4:
+            played_nums: set[int] = set()
+            for h in holes:
+                try:
+                    played_nums.add(int(h["hole"]))
+                except (TypeError, ValueError):
+                    pass
+            for h in range(1, 19):
+                if h not in played_nums and h in hole_pars:
+                    holes.append({"hole": h, "par": hole_pars[h], "score": None, "score_to_par": None, "result": None})
+            holes.sort(key=lambda x: (int(x["hole"]) if x["hole"] is not None else 99))
+
         break  # found the requested round; stop iterating
 
     return {

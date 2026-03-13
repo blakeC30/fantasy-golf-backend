@@ -26,7 +26,7 @@ LEAGUE_MEMBER_CAP = 500
 LEAGUE_PENDING_CAP = LEAGUE_MEMBER_CAP // 5  # 100
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session, joinedload
 
 from app.limiter import limiter
@@ -41,6 +41,11 @@ from app.models import (
     LeagueTournament,
     Pick,
     PlayoffConfig,
+    PlayoffDraftPreference,
+    PlayoffPod,
+    PlayoffPodMember,
+    PlayoffPick,
+    PlayoffRound,
     Season,
     Tournament,
     User,
@@ -48,6 +53,7 @@ from app.models import (
 from app.schemas.league import LeagueCreate, LeagueMemberOut, LeagueOut, LeagueUpdate, LeagueJoinPreview, LeagueRequestOut, RoleUpdate
 from app.schemas.tournament import LeagueTournamentOut, TournamentOut
 from app.models.tournament import TournamentStatus
+from app.services.picks import all_r1_teed_off as _all_r1_teed_off
 from app.services.scraper import score_picks
 
 router = APIRouter(prefix="/leagues", tags=["leagues"])
@@ -337,13 +343,86 @@ def update_member_role(
     return membership
 
 
+# ---------------------------------------------------------------------------
+# Member removal helpers
+# ---------------------------------------------------------------------------
+
+
+def _remove_member_picks_and_playoff(
+    db: Session, league: League, user_id: uuid.UUID
+) -> None:
+    """
+    Clean up season data for a member leaving or being removed from a league.
+
+    Handles three cases from the rules:
+      1. Regular season: deletes all Pick records for the current season.
+      2. Playoffs, member NOT in playoffs: same — picks deleted, no bracket impact.
+      3. Playoffs, member IS in playoffs: the pod slot is preserved (bracket
+         structure is never reshuffled). Picks and preference lists are deleted
+         so all their slots score as no-picks. The PlayoffPodMember row is kept
+         but marked is_eliminated=True so the vacant slot can never win the pod,
+         regardless of how other members score.
+
+    Only non-completed playoff rounds are affected. Rounds that have already been
+    scored and advanced are left entirely intact — prior-round picks, scores, and
+    winner records are permanent history and must not change.
+
+    Called from both leave_league() and remove_member() so both paths are
+    identical in their cleanup behavior.
+    """
+    season = db.query(Season).filter_by(league_id=league.id, is_active=True).first()
+    if not season:
+        return  # No active season — nothing to clean up.
+
+    # 1. Delete all regular-season picks for this user in this league/season.
+    db.query(Pick).filter_by(
+        league_id=league.id,
+        user_id=user_id,
+        season_id=season.id,
+    ).delete()
+
+    # 2. Vacate playoff pod slots for this season (if any).
+    #    A member may appear in multiple pods (one per round they reached).
+    #    We keep the PlayoffPodMember row so the bracket is unchanged, but
+    #    clear picks/preferences and mark the slot ineligible to win.
+    #
+    #    Only non-completed rounds are touched. Completed rounds (already scored
+    #    and advanced) are left entirely intact — picks, scores, and winner
+    #    records from prior rounds are permanent history.
+    config = db.query(PlayoffConfig).filter_by(
+        league_id=league.id, season_id=season.id
+    ).first()
+    if config:
+        pod_members = (
+            db.query(PlayoffPodMember)
+            .join(PlayoffPod, PlayoffPodMember.pod_id == PlayoffPod.id)
+            .join(PlayoffRound, PlayoffPod.playoff_round_id == PlayoffRound.id)
+            .filter(
+                PlayoffRound.playoff_config_id == config.id,
+                PlayoffPodMember.user_id == user_id,
+                PlayoffRound.status != "completed",
+            )
+            .all()
+        )
+        for pm in pod_members:
+            # Delete resolved picks (no ORM cascade from pod_member → picks).
+            db.query(PlayoffPick).filter_by(pod_member_id=pm.id).delete()
+            # Delete submitted preferences (also no cascade, explicit delete).
+            db.query(PlayoffDraftPreference).filter_by(pod_member_id=pm.id).delete()
+            # Mark the slot ineligible — _determine_pod_winner skips is_eliminated=True.
+            pm.is_eliminated = True
+
+    db.flush()
+
+
 @router.delete("/{league_id}/members/me", status_code=204)
 def leave_league(
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
     db: Session = Depends(get_db),
 ):
     """Allow any approved member to leave a league voluntarily."""
-    _, membership = league_and_member
+    league, membership = league_and_member
+    _remove_member_picks_and_playoff(db, league, membership.user_id)
     db.delete(membership)
     db.commit()
 
@@ -366,6 +445,7 @@ def remove_member(
     if not membership:
         raise HTTPException(status_code=404, detail="Member not found")
 
+    _remove_member_picks_and_playoff(db, league, user_id)
     db.delete(membership)
     db.commit()
 
@@ -472,10 +552,16 @@ def deny_join_request(
 # ---------------------------------------------------------------------------
 
 
-def _build_league_tournament_out(row: LeagueTournament) -> LeagueTournamentOut:
-    """Build a LeagueTournamentOut from a LeagueTournament row, resolving effective_multiplier."""
+def _build_league_tournament_out(row: LeagueTournament, db: Session) -> LeagueTournamentOut:
+    """Build a LeagueTournamentOut from a LeagueTournament row, resolving effective_multiplier.
+
+    all_r1_teed_off is only computed for in-progress tournaments (checking the DB
+    for the last Round 1 tee time). For scheduled or completed tournaments it is
+    always False — the value is irrelevant outside the in-progress window.
+    """
     t = row.tournament
     effective = row.multiplier if row.multiplier is not None else t.multiplier
+    in_progress = t.status == TournamentStatus.IN_PROGRESS.value
     return LeagueTournamentOut(
         id=t.id,
         pga_tour_id=t.pga_tour_id,
@@ -487,6 +573,7 @@ def _build_league_tournament_out(row: LeagueTournament) -> LeagueTournamentOut:
         status=t.status,
         is_team_event=t.is_team_event,
         effective_multiplier=effective,
+        all_r1_teed_off=_all_r1_teed_off(db, t.id) if in_progress else False,
     )
 
 
@@ -509,12 +596,19 @@ def get_league_tournaments(
         .order_by(Tournament.start_date.asc())
         .all()
     )
-    return [_build_league_tournament_out(row) for row in rows]
+    return [_build_league_tournament_out(row, db) for row in rows]
 
 
 class TournamentScheduleItem(BaseModel):
     tournament_id: uuid.UUID
     multiplier: float | None = None  # None = inherit from tournament.multiplier
+
+    @field_validator("multiplier")
+    @classmethod
+    def multiplier_must_be_valid(cls, v: float | None) -> float | None:
+        if v is not None and v not in (1.0, 1.5, 2.0):
+            raise ValueError("multiplier must be 1.0, 1.5, or 2.0")
+        return v
 
 
 class TournamentScheduleUpdate(BaseModel):
@@ -533,10 +627,13 @@ def update_league_tournaments(
     Accepts a full list of {tournament_id, multiplier} objects.
     Multiplier may be null to inherit the tournament's global default.
 
-    Validation: if the league has a pending playoff config, the new schedule
-    must include enough future (scheduled) tournaments to fill the bracket.
-    Playoff rounds are automatically the last N scheduled tournaments in the
-    schedule — no explicit per-tournament flag required.
+    Validation:
+    - Schedule is locked once the last tournament in the current schedule has
+      status COMPLETED — no further changes are allowed.
+    - At most one tournament per ISO calendar week (same week = same ISO year+week).
+    - If the league has a pending playoff config, the new schedule must include
+      enough future (scheduled) tournaments to fill the bracket. Playoff rounds
+      are automatically the last N scheduled tournaments — no explicit flag needed.
 
     All completed tournaments are re-scored after save.
 
@@ -553,6 +650,51 @@ def update_league_tournaments(
         if len(rows) != len(tournament_ids):
             raise HTTPException(status_code=422, detail="One or more tournament IDs not found")
         tournament_map = {t.id: t for t in rows}
+
+    # Rule: all tournaments must fall within the active season's calendar year.
+    active_season = db.query(Season).filter_by(league_id=league.id, is_active=True).first()
+    if active_season:
+        for t in tournament_map.values():
+            if t.start_date.year != active_season.year:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{t.name!r} starts in {t.start_date.year}, but the active season is "
+                        f"{active_season.year} — only tournaments from that year can be scheduled"
+                    ),
+                )
+
+    # Rule: schedule locks once the last regular season tournament is completed.
+    # Query the current schedule (before any changes) and find its last tournament.
+    last_in_schedule = (
+        db.query(Tournament)
+        .join(LeagueTournament, LeagueTournament.tournament_id == Tournament.id)
+        .filter(LeagueTournament.league_id == league.id)
+        .order_by(Tournament.start_date.desc())
+        .first()
+    )
+    if last_in_schedule and last_in_schedule.status == TournamentStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=422,
+            detail="Schedule is locked — the final regular season tournament has already completed",
+        )
+
+    # Rule: only one tournament per ISO calendar week.
+    week_map: dict[tuple[int, int], str] = {}
+    for item in body.tournaments:
+        t = tournament_map.get(item.tournament_id)
+        if t:
+            iso = t.start_date.isocalendar()
+            key = (iso.year, iso.week)
+            if key in week_map:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Schedule cannot include more than one tournament per calendar week "
+                        f"({week_map[key]!r} and {t.name!r} are in the same week)"
+                    ),
+                )
+            week_map[key] = t.name
 
     # If a pending playoff config exists, ensure the new schedule has enough
     # eligible future tournaments (scheduled, not the current week's tournament).
@@ -615,4 +757,4 @@ def update_league_tournaments(
         .order_by(Tournament.start_date.asc())
         .all()
     )
-    return [_build_league_tournament_out(row) for row in rows]
+    return [_build_league_tournament_out(row, db) for row in rows]

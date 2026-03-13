@@ -33,7 +33,7 @@ app/
 │   ├── user.py       # UserOut, UserUpdate
 │   ├── league.py     # LeagueCreate/Update/Out, LeagueMemberOut, RoleUpdate,
 │   │                 #   LeagueJoinPreview, LeagueRequestOut
-│   ├── tournament.py # TournamentOut
+│   ├── tournament.py # TournamentOut, LeagueTournamentOut (adds effective_multiplier + all_r1_teed_off), GolferInFieldOut (field endpoint — golfer + tee_time)
 │   ├── golfer.py     # GolferOut
 │   ├── pick.py       # PickCreate, PickUpdate, PickOut
 │   └── standings.py  # StandingsRow, StandingsResponse
@@ -92,11 +92,11 @@ All routes are prefixed with `/api/v1`.
 | POST | `/leagues/{league_id}/requests/{user_id}/approve` | manager | |
 | DELETE | `/leagues/{league_id}/requests/me` | token | User withdraws own request |
 | DELETE | `/leagues/{league_id}/requests/{user_id}` | manager | Deny request |
-| GET | `/leagues/{league_id}/tournaments` | member | League's selected tournaments (returns `LeagueTournamentOut` with `effective_multiplier`) |
+| GET | `/leagues/{league_id}/tournaments` | member | League's selected tournaments (returns `LeagueTournamentOut` with `effective_multiplier` and `all_r1_teed_off`) |
 | PUT | `/leagues/{league_id}/tournaments` | manager | Atomically replace schedule; body: `{tournaments: [{tournament_id, multiplier?}]}`; validates sufficient future tournaments for playoff config if pending |
 | GET | `/tournaments` | token | All/filtered by status |
 | GET | `/tournaments/{id}` | token | Tournament details |
-| GET | `/tournaments/{id}/field` | token | Golfers in field |
+| GET | `/tournaments/{id}/field` | token | Golfers in field — returns `GolferInFieldOut[]` (includes `tee_time`); WD golfers excluded; all others returned regardless of status so frontend can grey out teed-off golfers |
 | GET | `/golfers` | token | List/search golfers |
 | GET | `/golfers/{id}` | token | Golfer details |
 | POST | `/leagues/{league_id}/picks` | member | Submit pick |

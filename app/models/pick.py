@@ -129,7 +129,12 @@ class Pick(Base):
         Lock rules (mirrors the backend validation in services/picks.py):
           - COMPLETED  → always locked (tournament is over)
           - IN_PROGRESS → locked once the golfer's Round 1 tee_time has passed,
-                          or immediately if tee_time is null (safety: no data = locked)
+                          or immediately if tee_time is null (safety: no data = locked).
+                          Exception: if the golfer has a WD status AND no Round 1
+                          TournamentEntryRound data exists, they withdrew before teeing
+                          off — the pick is unlocked so the member can swap to any golfer
+                          who hasn't yet teed off. Round data presence (not tee_time
+                          comparison) is the source of truth for whether a golfer played.
           - SCHEDULED  → never locked here (deadline enforced by start_date check
                           in validate_new_pick / validate_pick_change)
         """
@@ -138,8 +143,21 @@ class Pick(Base):
         if self.tournament.status == TournamentStatus.COMPLETED.value:
             return True
         if self.tournament.status == TournamentStatus.IN_PROGRESS.value:
-            if self.entry is None or self.entry.tee_time is None:
-                return True  # no tee_time when in_progress → locked (safety)
+            if self.entry is None:
+                return True  # safety: no entry data = locked
+            # Determine whether the golfer actually started their round.
+            # TournamentEntryRound rows are only created once a golfer tees off and
+            # the scraper processes their linescore data. A WD with no R1 round data
+            # means a pre-tee-time scratch (late withdrawal), so the pick is unlocked.
+            r1_played = any(r.round_number == 1 for r in self.entry.rounds)
+            if (
+                self.entry.status is not None
+                and "wd" in self.entry.status.lower()
+                and not r1_played
+            ):
+                return False  # withdrew before teeing off — member may swap
+            if self.entry.tee_time is None:
+                return True  # belt-and-suspenders: no tee_time when in_progress = locked
             return self.entry.tee_time <= datetime.now(timezone.utc)
         return False
 

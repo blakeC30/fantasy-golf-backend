@@ -20,8 +20,16 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.drop_index("ix_leagues_slug", table_name="leagues")
-    op.drop_column("leagues", "slug")
+    conn = op.get_bind()
+    has_slug = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='leagues' AND column_name='slug'"
+        )
+    ).fetchone()
+    if has_slug:
+        op.drop_index("ix_leagues_slug", table_name="leagues")
+        op.drop_column("leagues", "slug")
 
 
 def downgrade() -> None:

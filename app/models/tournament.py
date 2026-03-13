@@ -268,4 +268,13 @@ class TournamentEntryRound(Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
+    # Count of holes completed in this round (derived from nested linescores length).
+    # Null for rounds that haven't started. 18 means the round is complete.
+    # Used by the leaderboard to suppress partial round scores and power Today/Thru display.
+    thru: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # True when the golfer's first hole played in this round was >= 10 (back-nine start).
+    # Displayed as an asterisk next to the Thru number (e.g. "8*").
+    started_on_back: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
     entry: Mapped["TournamentEntry"] = relationship(back_populates="rounds")

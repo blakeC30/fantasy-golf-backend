@@ -23,6 +23,7 @@ from app.dependencies import get_current_user
 from app.models import Golfer, Tournament, TournamentEntry, TournamentStatus, User
 from app.schemas.golfer import GolferOut
 from app.schemas.tournament import (
+    GolferInFieldOut,
     LeaderboardEntryOut,
     LeaderboardOut,
     RoundSummaryOut,
@@ -71,24 +72,26 @@ def get_tournament(
     return tournament
 
 
-@router.get("/{tournament_id}/field", response_model=list[GolferOut])
+@router.get("/{tournament_id}/field", response_model=list[GolferInFieldOut])
 def get_tournament_field(
     tournament_id: uuid.UUID,
     _: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Return the golfers entered in a tournament's field.
+    Return the golfers entered in a tournament's field with their Round 1 tee times.
 
     Used by the pick form to show which golfers are available to pick.
     Sorted by world_ranking (ascending — lower rank = better player).
 
-    When the tournament is IN_PROGRESS, only golfers who haven't teed off yet
-    are returned (tee_time in the future and not withdrawn). This prevents the
-    pick form from showing ineligible golfers.
-    """
-    from datetime import datetime, timezone
+    All non-withdrawn golfers are returned regardless of tournament status.
+    The ``tee_time`` field on each entry lets the frontend grey out golfers
+    whose tee time has already passed when the tournament is in_progress,
+    giving the user clear visual feedback instead of a server-side error.
 
+    WD (withdrawn) golfers are excluded — they cannot be picked and showing
+    them would be confusing since they are no longer competing.
+    """
     tournament = db.query(Tournament).filter_by(id=tournament_id).first()
     if not tournament:
         raise HTTPException(status_code=404, detail="Tournament not found")
@@ -102,16 +105,20 @@ def get_tournament_field(
         .all()
     )
 
-    if tournament.status == TournamentStatus.IN_PROGRESS.value:
-        now = datetime.now(timezone.utc)
-        entries = [
-            e for e in entries
-            if e.tee_time is not None
-            and e.tee_time > now
-            and e.status != "WD"
-        ]
+    # Exclude withdrawn golfers — they are no longer competing and cannot be picked.
+    entries = [e for e in entries if e.status != "WD"]
 
-    return [e.golfer for e in entries]
+    return [
+        GolferInFieldOut(
+            id=e.golfer.id,
+            pga_tour_id=e.golfer.pga_tour_id,
+            name=e.golfer.name,
+            world_ranking=e.golfer.world_ranking,
+            country=e.golfer.country,
+            tee_time=e.tee_time,
+        )
+        for e in entries
+    ]
 
 
 @router.get("/{tournament_id}/leaderboard", response_model=LeaderboardOut)

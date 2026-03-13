@@ -69,9 +69,10 @@ from app.schemas.playoff import (
     PlayoffRoundOut,
     PlayoffTournamentPickOut,
 )
-from app.services.picks import all_r1_teed_off
 from app.services.playoff import (
     advance_bracket,
+    any_r1_teed_off,
+    first_r1_tee_time,
     open_round_draft,
     override_result,
     resolve_draft,
@@ -289,12 +290,12 @@ def update_playoff_config(
     season: Season = Depends(get_active_season),
     db: Session = Depends(get_db),
 ):
-    """Update playoff config (manager only). Cannot change once seeded."""
+    """Update playoff config (manager only). Cannot change once the bracket is active."""
     league, _ = league_and_member
     config = _get_config_or_404(league.id, season.id, db)
 
     if config.status != "pending":
-        raise HTTPException(status_code=422, detail="Cannot modify config after playoff is seeded")
+        raise HTTPException(status_code=422, detail="Cannot modify config after the playoff bracket is active")
 
     if body.playoff_size is not None:
         if body.playoff_size > 0:
@@ -355,8 +356,10 @@ def get_bracket(
     rounds_out = []
     for r in sorted(config_loaded.rounds, key=lambda r: r.round_number):
         is_picks_visible = True
+        # Playoff rule: picks are hidden until the FIRST R1 tee time passes.
+        # (Regular season hides until the LAST tee time — different rule.)
         if r.status == "locked" and r.tournament and r.tournament.status == "in_progress":
-            is_picks_visible = all_r1_teed_off(db, r.tournament_id)
+            is_picks_visible = any_r1_teed_off(db, r.tournament_id)
         rounds_out.append(_build_bracket_round_out(r, config_loaded, is_picks_visible=is_picks_visible))
 
     return BracketOut(playoff_config=config_loaded, rounds=rounds_out)
@@ -512,9 +515,12 @@ def get_draft_status(
     playoff_round = pod.playoff_round
     tournament = playoff_round.tournament
 
-    # deadline = tournament start date
-    from app.models import Tournament
-    deadline = tournament.start_date if tournament else None
+    # required_preference_count = pod_size * picks_per_round for this round
+    config = playoff_round.playoff_config
+    idx = playoff_round.round_number - 1
+    ppr = config.picks_per_round[idx] if idx < len(config.picks_per_round) else config.picks_per_round[-1]
+    pod_size = len(pod.members)
+    required_preference_count: int | None = (pod_size * ppr) if pod_size > 0 else None
 
     members_out: list[PlayoffPodMemberDraftOut] = []
     for member in sorted(pod.members, key=lambda m: m.seed):
@@ -534,21 +540,28 @@ def get_draft_status(
 
     picks_out = [_build_pick_out(p) for p in sorted(pod.picks, key=lambda p: p.draft_slot)]
 
-    # Hide resolved picks until all Round 1 tee times have passed
+    # Hide resolved picks until the first Round 1 tee time has passed.
+    # Playoff rule: once any golfer tees off, all pod picks become visible.
     if playoff_round.status == "locked" and tournament and tournament.status == "in_progress":
-        if not all_r1_teed_off(db, tournament.id):
+        if not any_r1_teed_off(db, tournament.id):
             picks_out = []
 
-    # Convert deadline date → datetime for schema (schema expects datetime)
+    # Deadline = first R1 tee time (the moment preferences lock).
+    # Falls back to tournament.start_date midnight when tee times are not yet in the DB.
     from datetime import datetime, timezone
     deadline_dt: datetime | None = None
-    if deadline:
-        deadline_dt = datetime.combine(deadline, datetime.min.time()).replace(tzinfo=timezone.utc)
+    if tournament:
+        deadline_dt = first_r1_tee_time(db, tournament.id)
+        if deadline_dt is None and tournament.start_date:
+            deadline_dt = datetime.combine(
+                tournament.start_date, datetime.min.time()
+            ).replace(tzinfo=timezone.utc)
 
     return PlayoffDraftStatusOut(
         pod_id=pod.id,
         round_status=playoff_round.status,
         deadline=deadline_dt,
+        required_preference_count=required_preference_count,
         members=members_out,
         resolved_picks=picks_out,
     )
@@ -764,9 +777,12 @@ def get_my_playoff_pod(
     )
     required_preference_count = pod_size * ppr
 
-    deadline_dt = datetime.combine(
-        nearest.start_date, time.min
-    ).replace(tzinfo=timezone.utc)
+    # Deadline = first R1 tee time; falls back to start_date midnight if not yet available.
+    deadline_dt = first_r1_tee_time(db, nearest.id)
+    if deadline_dt is None and nearest.start_date:
+        deadline_dt = datetime.combine(
+            nearest.start_date, time.min
+        ).replace(tzinfo=timezone.utc)
 
     return MyPlayoffPodOut(
         is_playoff_week=True,

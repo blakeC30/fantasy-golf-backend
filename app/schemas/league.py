@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.schemas.user import UserOut
 
@@ -14,12 +14,26 @@ class LeagueCreate(BaseModel):
     # Default matches the house rule; league manager can override on creation.
     no_pick_penalty: int = -50_000
 
+    @field_validator("no_pick_penalty")
+    @classmethod
+    def penalty_must_be_non_positive(cls, v: int) -> int:
+        if v > 0:
+            raise ValueError("no_pick_penalty must be 0 or negative")
+        return v
+
 
 class LeagueUpdate(BaseModel):
     """Partial update for league settings. Only provided fields are changed."""
     name: str | None = None
     description: str | None = None
     no_pick_penalty: int | None = None
+
+    @field_validator("no_pick_penalty")
+    @classmethod
+    def penalty_must_be_non_positive(cls, v: int | None) -> int | None:
+        if v is not None and v > 0:
+            raise ValueError("no_pick_penalty must be 0 or negative")
+        return v
 
 
 class LeagueOut(BaseModel):

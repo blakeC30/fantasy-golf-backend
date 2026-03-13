@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -28,6 +28,14 @@ class Season(Base):
     __table_args__ = (
         # Each league can only have one season per year.
         UniqueConstraint("league_id", "year", name="uq_league_season_year"),
+        # Each league can only have one active season at a time.
+        # Partial unique index — only applies to rows where is_active = TRUE.
+        Index(
+            "uq_league_one_active_season",
+            "league_id",
+            unique=True,
+            postgresql_where=text("is_active = true"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)

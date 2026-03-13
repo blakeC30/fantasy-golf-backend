@@ -18,8 +18,8 @@ class PlayoffConfigCreate(BaseModel):
     @field_validator("playoff_size")
     @classmethod
     def must_be_power_of_two(cls, v: int) -> int:
-        if v not in (2, 4, 8, 16, 32):
-            raise ValueError("playoff_size must be 2, 4, 8, 16, or 32")
+        if v not in (0, 2, 4, 8, 16, 32):
+            raise ValueError("playoff_size must be 0 (disabled), 2, 4, 8, 16, or 32")
         return v
 
     @field_validator("draft_style")
@@ -27,6 +27,15 @@ class PlayoffConfigCreate(BaseModel):
     def must_be_valid_style(cls, v: str) -> str:
         if v not in ("snake", "linear", "top_seed_priority"):
             raise ValueError("draft_style must be snake, linear, or top_seed_priority")
+        return v
+
+    @field_validator("picks_per_round")
+    @classmethod
+    def picks_must_be_positive(cls, v: list[int]) -> list[int]:
+        if not v:
+            raise ValueError("picks_per_round must not be empty")
+        if any(n < 1 for n in v):
+            raise ValueError("each value in picks_per_round must be at least 1")
         return v
 
 
@@ -40,6 +49,17 @@ class PlayoffConfigUpdate(BaseModel):
     def must_be_power_of_two(cls, v: int | None) -> int | None:
         if v is not None and v not in (0, 2, 4, 8, 16, 32):
             raise ValueError("playoff_size must be 0 (disabled), 2, 4, 8, 16, or 32")
+        return v
+
+    @field_validator("picks_per_round")
+    @classmethod
+    def picks_must_be_positive(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("picks_per_round must not be empty")
+        if any(n < 1 for n in v):
+            raise ValueError("each value in picks_per_round must be at least 1")
         return v
 
 
@@ -176,6 +196,7 @@ class PlayoffDraftStatusOut(BaseModel):
     pod_id: int
     round_status: str  # drafting | locked
     deadline: datetime | None  # = tournament.start_date; None if no tournament assigned yet
+    required_preference_count: int | None  # pod_size * picks_per_round; None until seeded
     members: list[PlayoffPodMemberDraftOut]  # includes has_submitted flag + preference count
     resolved_picks: list[PlayoffPickOut]  # empty until resolved
 

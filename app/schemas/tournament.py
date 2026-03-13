@@ -7,6 +7,25 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 
+class GolferInFieldOut(BaseModel):
+    """Golfer entry returned by GET /tournaments/{id}/field.
+
+    Extends the base golfer fields with ``tee_time`` from the
+    TournamentEntry row so the frontend can identify which golfers
+    have already teed off when the tournament is in_progress.
+    ``tee_time`` is None when tee times have not yet been assigned.
+    """
+
+    id: uuid.UUID
+    pga_tour_id: str
+    name: str
+    world_ranking: int | None
+    country: str | None
+    tee_time: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class TournamentOut(BaseModel):
     id: uuid.UUID
     pga_tour_id: str
@@ -27,9 +46,15 @@ class LeagueTournamentOut(TournamentOut):
     effective_multiplier resolves to the league's per-tournament override if set,
     falling back to the global tournament.multiplier. Frontend uses this value
     to display and pre-populate the multiplier picker in the manage page.
+
+    all_r1_teed_off is True when every Round 1 tee time for an in-progress
+    tournament has passed. The frontend uses this to hide the pick button when
+    a member has no pick and the late-entry window has closed. Defaults to
+    False (safe default — never hide the button unless we know all teed off).
     """
 
     effective_multiplier: float
+    all_r1_teed_off: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +68,8 @@ class RoundSummaryOut(BaseModel):
     position: str | None
     tee_time: datetime | None
     is_playoff: bool = False
+    thru: int | None = None
+    started_on_back: bool | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

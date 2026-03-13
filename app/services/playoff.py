@@ -18,9 +18,11 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
+from sqlalchemy import func as sqlfunc
 from sqlalchemy.orm import Session
 
 from app.models import (
+    League,
     PlayoffConfig,
     PlayoffDraftPreference,
     PlayoffPick,
@@ -161,7 +163,7 @@ def seed_playoff(db: Session, config: PlayoffConfig) -> None:
     Raises HTTPException on any validation failure.
     """
     if config.status != "pending":
-        raise HTTPException(status_code=422, detail="Playoff is already seeded or active")
+        raise HTTPException(status_code=422, detail="Playoff bracket is already active")
 
     from app.models import League, LeagueTournament, Season, Tournament as TournamentModel
     from app.models.tournament import TournamentStatus
@@ -264,10 +266,56 @@ def seed_playoff(db: Session, config: PlayoffConfig) -> None:
         for i, member in enumerate(sorted(pod.members, key=lambda m: m.seed)):
             member.draft_position = i + 1
 
-    config.status = "seeded"
+    config.status = "active"
     config.seeded_at = datetime.now(timezone.utc)
     config.is_enabled = True
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Preference window helpers
+# ---------------------------------------------------------------------------
+
+def first_r1_tee_time(db: Session, tournament_id) -> datetime | None:
+    """
+    Returns the earliest Round 1 tee time in the tournament field, or None if
+    no tee times are available yet (field not synced).
+
+    Used to determine when the playoff preference window closes: submissions
+    are blocked once the first golfer in the field has teed off.
+    """
+    earliest = (
+        db.query(sqlfunc.min(TournamentEntry.tee_time))
+        .filter(
+            TournamentEntry.tournament_id == tournament_id,
+            TournamentEntry.tee_time.isnot(None),
+        )
+        .scalar()
+    )
+    if earliest is None:
+        return None
+    if earliest.tzinfo is None:
+        earliest = earliest.replace(tzinfo=timezone.utc)
+    return earliest
+
+
+def any_r1_teed_off(db: Session, tournament_id) -> bool:
+    """
+    True if the FIRST Round 1 tee time has passed (i.e. any golfer has teed off).
+
+    Used for playoff pick visibility: picks become visible to all pod members
+    once the first golfer in the field tees off.
+
+    Distinct from all_r1_teed_off() in picks.py, which waits for the LAST
+    tee time — that is the rule for regular-season pick visibility.
+
+    Returns False when no tee times are in the DB yet (field not synced),
+    keeping picks hidden until data is available.
+    """
+    first_tee = first_r1_tee_time(db, tournament_id)
+    if first_tee is None:
+        return False
+    return first_tee <= datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +326,12 @@ def open_round_draft(db: Session, playoff_round: PlayoffRound) -> None:
     """
     Transition a round and all its pods from pending → drafting.
 
-    For round 1 with a pending (unseeded) config, seeding is performed
-    automatically first, based on current standings and the league's
-    selected playoff tournaments.
+    For round 1, if the bracket has not yet been seeded (config.status == "pending"),
+    seeding is performed automatically first using current regular-season standings.
+
+    For rounds > 1, the previous round's tournament must be completed before
+    preferences can open (rule: preferences cannot open before the previous
+    tournament completes).
     """
     config = playoff_round.playoff_config
 
@@ -288,6 +339,32 @@ def open_round_draft(db: Session, playoff_round: PlayoffRound) -> None:
     if playoff_round.round_number == 1 and config.status == "pending":
         seed_playoff(db, config)
         db.refresh(playoff_round)
+
+    # For round 2+: require the previous round's tournament to be completed.
+    if playoff_round.round_number > 1:
+        prev_round = (
+            db.query(PlayoffRound)
+            .filter_by(
+                playoff_config_id=playoff_round.playoff_config_id,
+                round_number=playoff_round.round_number - 1,
+            )
+            .first()
+        )
+        if prev_round is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Previous playoff round not found",
+            )
+        # The previous round must be fully completed (scored, advanced) before
+        # opening preferences for the next round.
+        if prev_round.status != "completed":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Cannot open round {playoff_round.round_number} preferences — "
+                    f"round {prev_round.round_number} has not completed yet"
+                ),
+            )
 
     if playoff_round.tournament_id is None:
         raise HTTPException(
@@ -298,9 +375,6 @@ def open_round_draft(db: Session, playoff_round: PlayoffRound) -> None:
     playoff_round.status = "drafting"
     for pod in playoff_round.pods:
         pod.status = "drafting"
-
-    if config.status == "seeded":
-        config.status = "active"
 
     db.commit()
 
@@ -320,9 +394,14 @@ def submit_preferences(
 
     Validates:
     1. The round is in 'drafting' status
-    2. Tournament has not yet started (now < tournament.start_date)
-    3. All golfer_ids exist in the tournament field
+    2. Preference window is still open: first R1 tee time has not yet passed
+       (falls back to start_date when tee times are not yet in the DB)
+    3. Exact required count: pod_size * picks_per_round
     4. No duplicate golfer_ids in the submitted list
+
+    Note: golfers are NOT validated against the tournament field at submission time.
+    Any golfer in the DB may be ranked. Non-field golfers are silently skipped
+    at resolution time (resolve_draft).
     """
     # Load the playoff round through the pod
     pod = pod_member.pod
@@ -340,12 +419,23 @@ def submit_preferences(
     if not tournament:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
-    now_date = datetime.now(timezone.utc).date()
-    if now_date >= tournament.start_date:
-        raise HTTPException(
-            status_code=422,
-            detail="Tournament has already started; preference submission is closed",
-        )
+    # Preference window closes when the first R1 tee time passes (rule: lock is
+    # triggered by the very first tee time, not a specific golfer's tee time).
+    # If tee times are not yet in the DB, fall back to start_date as a safety net.
+    now_utc = datetime.now(timezone.utc)
+    first_tee = first_r1_tee_time(db, tournament_id)
+    if first_tee is not None:
+        if first_tee <= now_utc:
+            raise HTTPException(
+                status_code=422,
+                detail="Preference window is closed — the first golfer has already teed off",
+            )
+    else:
+        if now_utc.date() >= tournament.start_date:
+            raise HTTPException(
+                status_code=422,
+                detail="Preference window is closed — the tournament has already started",
+            )
 
     # Validate exact required count: pod_size * picks_per_round
     config = playoff_round.playoff_config
@@ -363,20 +453,8 @@ def submit_preferences(
     if len(golfer_ids) != len(set(golfer_ids)):
         raise HTTPException(status_code=422, detail="Duplicate golfer IDs in preference list")
 
-    # Validate all golfers are in the tournament field (skip if field not yet released)
-    field_released = db.query(TournamentEntry).filter_by(tournament_id=tournament_id).limit(1).first() is not None
-    if field_released:
-        for golfer_id in golfer_ids:
-            entry = (
-                db.query(TournamentEntry)
-                .filter_by(tournament_id=tournament_id, golfer_id=golfer_id)
-                .first()
-            )
-            if not entry:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Golfer {golfer_id} is not in the tournament field",
-                )
+    # No field-membership validation at submission time (rule: any golfer in the DB
+    # can be ranked at any time). Non-field golfers are silently skipped at resolution.
 
     # Delete all existing preferences for this pod_member (atomic replace)
     db.query(PlayoffDraftPreference).filter_by(pod_member_id=pod_member.id).delete()
@@ -409,6 +487,10 @@ def resolve_draft(db: Session, playoff_round: PlayoffRound) -> None:
     Called by admin after tournament.start_date.
     Processes all submitted preference lists in draft order.
     Players with no submitted list get no picks (earn $0).
+
+    Field-membership check: golfers not in the official tournament field are
+    silently skipped. If all of a member's preferences are ineligible, they
+    receive no pick for that slot and earn $0.
     """
     if playoff_round.status != "drafting":
         raise HTTPException(
@@ -417,6 +499,17 @@ def resolve_draft(db: Session, playoff_round: PlayoffRound) -> None:
         )
 
     config = playoff_round.playoff_config
+
+    # Pre-load tournament field as a set for efficient membership checks.
+    # If the field has not been synced yet the set is empty and all preferences
+    # are skipped — resolution should only be called once the field is available.
+    field_golfer_ids: set[uuid.UUID] = {
+        row.golfer_id
+        for row in db.query(TournamentEntry.golfer_id)
+        .filter_by(tournament_id=playoff_round.tournament_id)
+        .all()
+    }
+    field_released = len(field_golfer_ids) > 0
 
     for pod in playoff_round.pods:
         idx = playoff_round.round_number - 1
@@ -441,14 +534,21 @@ def resolve_draft(db: Session, playoff_round: PlayoffRound) -> None:
                 .all()
             )
 
-            # Find best available pick from this player's preferences
+            # Find best available pick from this player's preferences.
+            # Skip golfers already claimed by a higher-priority slot AND golfers
+            # not in the official tournament field (silently skipped per rule).
             picked_golfer_id = next(
-                (p.golfer_id for p in prefs if p.golfer_id not in claimed),
+                (
+                    p.golfer_id for p in prefs
+                    if p.golfer_id not in claimed
+                    and (not field_released or p.golfer_id in field_golfer_ids)
+                ),
                 None,
             )
 
             if picked_golfer_id is None:
-                # No list submitted or all preferences claimed — no pick for this slot
+                # No list submitted, all preferences claimed, or all preferences
+                # were for golfers not in the tournament field — no pick for this slot.
                 continue
 
             db.add(PlayoffPick(
@@ -476,10 +576,29 @@ def score_round(db: Session, playoff_round: PlayoffRound) -> None:
     Populate points_earned for all playoff_picks in this round and
     update playoff_pod_members.total_points.
     Called by admin after the assigned tournament completes.
+
+    No-pick penalty: applied once per unresolved pick slot (i.e., expected slots
+    minus actual assigned picks). Uses league.no_pick_penalty — the same value
+    as the regular season penalty, configurable by the league manager.
     """
     tournament = playoff_round.tournament
     if tournament is None:
         raise HTTPException(status_code=422, detail="No tournament assigned to this round")
+
+    config = playoff_round.playoff_config
+    league = db.query(League).filter_by(id=config.league_id).first()
+    if not league:
+        raise HTTPException(status_code=422, detail="League not found")
+
+    no_pick_penalty = league.no_pick_penalty  # negative int, e.g. -50_000
+
+    # How many picks each member is supposed to receive this round.
+    idx = playoff_round.round_number - 1
+    picks_per_player = (
+        config.picks_per_round[idx]
+        if idx < len(config.picks_per_round)
+        else config.picks_per_round[-1]
+    )
 
     multiplier = tournament.multiplier  # Use tournament's global multiplier
 
@@ -500,6 +619,14 @@ def score_round(db: Session, playoff_round: PlayoffRound) -> None:
                 earnings = entry.earnings_usd if entry and entry.earnings_usd else 0
                 pick.points_earned = earnings * multiplier
                 total += pick.points_earned
+
+            # Apply no-pick penalty for each slot that went unresolved.
+            # This covers: no preference list submitted, all preferences claimed,
+            # or all preferences were for golfers not in the tournament field.
+            missed_slots = picks_per_player - len(member_picks)
+            if missed_slots > 0:
+                total += missed_slots * no_pick_penalty
+
             member.total_points = total
 
     db.commit()
@@ -511,12 +638,22 @@ def score_round(db: Session, playoff_round: PlayoffRound) -> None:
 
 def _determine_pod_winner(pod: PlayoffPod) -> PlayoffPodMember:
     """
-    Winner = member with highest total_points.
+    Winner = eligible member with highest total_points.
     Tie-break: lower seed number (seed 1 beats seed 2 in a tie).
     Members with None total_points are treated as 0.
+
+    Members marked is_eliminated=True before scoring begins (i.e., vacated slots
+    from members who left the league mid-playoffs) are never eligible to win,
+    regardless of how other members score.
     """
+    eligible = [m for m in pod.members if not m.is_eliminated]
+    if not eligible:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pod {pod.id} has no eligible members — all slots are vacant",
+        )
     members_sorted = sorted(
-        pod.members,
+        eligible,
         key=lambda m: (-(m.total_points or 0.0), m.seed),
     )
     return members_sorted[0]

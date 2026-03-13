@@ -36,7 +36,6 @@ from app.models import (
     Season,
     Tournament,
     TournamentEntry,
-    TournamentEntryRound,
     TournamentStatus,
     User,
 )
@@ -188,16 +187,15 @@ def get_all_picks(
     )
     now_utc = datetime.now(tz=timezone.utc)
 
-    # Subquery: tournament IDs where the last Round 1 tee time has already passed.
+    # Subquery: tournament IDs where the last tee time has already passed.
+    # Uses TournamentEntry.tee_time — the same source as pick locking — for consistency.
     all_teed_off_sq = (
         db.query(TournamentEntry.tournament_id)
-        .join(TournamentEntryRound, TournamentEntryRound.tournament_entry_id == TournamentEntry.id)
         .filter(
-            TournamentEntryRound.round_number == 1,
-            TournamentEntryRound.tee_time.isnot(None),
+            TournamentEntry.tee_time.isnot(None),
         )
         .group_by(TournamentEntry.tournament_id)
-        .having(sqlfunc.max(TournamentEntryRound.tee_time) <= now_utc)
+        .having(sqlfunc.max(TournamentEntry.tee_time) <= now_utc)
         .subquery()
     )
 
