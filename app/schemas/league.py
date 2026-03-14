@@ -18,6 +18,8 @@ class LeagueCreate(BaseModel):
     def penalty_must_be_non_positive(cls, v: int) -> int:
         if v > 0:
             raise ValueError("no_pick_penalty must be 0 or negative")
+        if v < -500_000:
+            raise ValueError("no_pick_penalty cannot exceed -500,000")
         return v
 
 
@@ -31,6 +33,8 @@ class LeagueUpdate(BaseModel):
     def penalty_must_be_non_positive(cls, v: int | None) -> int | None:
         if v is not None and v > 0:
             raise ValueError("no_pick_penalty must be 0 or negative")
+        if v is not None and v < -500_000:
+            raise ValueError("no_pick_penalty cannot exceed -500,000")
         return v
 
 
