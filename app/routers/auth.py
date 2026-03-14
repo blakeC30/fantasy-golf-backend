@@ -2,29 +2,47 @@
 Auth router — /auth/*
 
 Endpoints:
-  POST /auth/register   Create a new account with email + password
-  POST /auth/login      Exchange credentials for JWT tokens
-  POST /auth/google     Exchange a Google ID token for JWT tokens
-  POST /auth/refresh    Use the refresh cookie to get a new access token
-  POST /auth/logout     Clear the refresh token cookie
+  POST /auth/register         Create a new account with email + password
+  POST /auth/login            Exchange credentials for JWT tokens
+  POST /auth/google           Exchange a Google ID token for JWT tokens
+  POST /auth/refresh          Use the refresh cookie to get a new access token
+  POST /auth/logout           Clear the refresh token cookie
+  POST /auth/forgot-password  Request a password reset email
+  POST /auth/reset-password   Submit a new password using a reset token
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
+log = logging.getLogger(__name__)
+
 from app.config import settings
+from app.limiter import limiter
 from app.database import get_db
 from app.dependencies import get_current_user, get_refresh_token_user
 from app.models import User
-from app.schemas.auth import GoogleAuthRequest, LoginRequest, RegisterRequest, TokenResponse
+from app.schemas.auth import (
+    ForgotPasswordRequest,
+    GoogleAuthRequest,
+    LoginRequest,
+    RegisterRequest,
+    ResetPasswordRequest,
+    TokenResponse,
+)
 from app.schemas.user import UserOut
 from app.services.auth import (
+    consume_reset_token,
     create_access_token,
     create_refresh_token,
+    generate_reset_token,
     hash_password,
+    validate_reset_token,
     verify_google_id_token,
     verify_password,
 )
+from app.services.email import send_password_reset_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -53,7 +71,8 @@ def _issue_tokens(user: User, response: Response) -> TokenResponse:
 
 
 @router.post("/register", response_model=TokenResponse, status_code=201)
-def register(body: RegisterRequest, response: Response, db: Session = Depends(get_db)):
+@limiter.limit("5/hour")
+def register(request: Request, body: RegisterRequest, response: Response, db: Session = Depends(get_db)):
     """
     Create a new user account.
 
@@ -76,7 +95,8 @@ def register(body: RegisterRequest, response: Response, db: Session = Depends(ge
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(body: LoginRequest, response: Response, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def login(request: Request, body: LoginRequest, response: Response, db: Session = Depends(get_db)):
     """Exchange email + password for JWT tokens."""
     user = db.query(User).filter_by(email=body.email.lower()).first()
 
@@ -88,7 +108,8 @@ def login(body: LoginRequest, response: Response, db: Session = Depends(get_db))
 
 
 @router.post("/google", response_model=TokenResponse)
-def google_auth(body: GoogleAuthRequest, response: Response, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def google_auth(request: Request, body: GoogleAuthRequest, response: Response, db: Session = Depends(get_db)):
     """
     Authenticate via Google Sign-In.
 
@@ -103,7 +124,8 @@ def google_auth(body: GoogleAuthRequest, response: Response, db: Session = Depen
 
     try:
         claims = verify_google_id_token(body.id_token)
-    except Exception:
+    except Exception as exc:
+        log.warning("Google token verification failed: %s", exc)
         raise HTTPException(status_code=401, detail="Invalid Google ID token")
 
     google_id = claims["sub"]
@@ -143,6 +165,51 @@ def refresh_token(
     """
     access = create_access_token(str(user.id))
     return TokenResponse(access_token=access)
+
+
+@router.post("/forgot-password", status_code=200)
+@limiter.limit("3/hour")
+def forgot_password(request: Request, body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """
+    Send a password reset email.
+
+    Always returns 200 regardless of whether the email exists in the system,
+    to prevent email enumeration attacks. Google-only accounts (no password_hash)
+    are silently skipped — they cannot reset a password they never set.
+    """
+    user = db.query(User).filter_by(email=body.email.lower()).first()
+    if user and user.password_hash:
+        raw = generate_reset_token(db, user)
+        try:
+            send_password_reset_email(user.email, raw)
+        except Exception:
+            # Log the error but don't let a SES failure expose account existence.
+            log.exception("Failed to send password reset email to %s", user.email)
+    return {"detail": "If an account with that email exists, a reset link has been sent."}
+
+
+@router.post("/reset-password", response_model=TokenResponse)
+@limiter.limit("10/hour")
+def reset_password(
+    request: Request,
+    body: ResetPasswordRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """
+    Set a new password using a reset token from the email link.
+
+    The token must be valid, unused, and not expired (1-hour TTL). On success
+    the token is consumed and the user is logged in immediately (access + refresh
+    tokens are issued), so they don't need a separate login step.
+    """
+    user = validate_reset_token(db, body.token)
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
+    user.password_hash = hash_password(body.new_password)
+    consume_reset_token(db, body.token)
+    db.commit()
+    return _issue_tokens(user, response)
 
 
 @router.post("/logout", status_code=204)

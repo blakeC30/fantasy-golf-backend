@@ -11,11 +11,12 @@ Endpoints:
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import require_platform_admin
+from app.limiter import limiter
 from app.models import Tournament, User
 from app.services.scraper import full_sync, sync_tournament
 
@@ -23,7 +24,9 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 @router.post("/sync")
+@limiter.limit("5/hour")
 def trigger_full_sync(
+    request: Request,
     year: int | None = None,
     force: bool = Query(False, description="When true, delete all existing round data before re-syncing each tournament"),
     _: User = Depends(require_platform_admin),
@@ -54,7 +57,9 @@ def trigger_full_sync(
 
 
 @router.post("/sync/{pga_tour_id}")
+@limiter.limit("10/hour")
 def trigger_tournament_sync(
+    request: Request,
     pga_tour_id: str,
     force: bool = Query(False, description="When true, delete all existing round data before re-syncing"),
     _: User = Depends(require_platform_admin),

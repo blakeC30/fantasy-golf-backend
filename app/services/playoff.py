@@ -23,12 +23,14 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     League,
+    LeagueTournament,
     PlayoffConfig,
     PlayoffDraftPreference,
     PlayoffPick,
     PlayoffPod,
     PlayoffPodMember,
     PlayoffRound,
+    Tournament,
     TournamentEntry,
 )
 from app.services.scoring import calculate_standings
@@ -160,10 +162,16 @@ def seed_playoff(db: Session, config: PlayoffConfig) -> None:
     schedule as playoff rounds, where N is derived from playoff_size.
     Tournaments are assigned to rounds in ascending start_date order.
 
-    Raises HTTPException on any validation failure.
+    Called automatically by get_bracket when the regular-season schedule locks
+    (exactly num_rounds scheduled tournaments remain — all regular-season ones
+    have completed). Also callable by the manager via POST /rounds/{id}/open as
+    an admin override.
+
+    Raises HTTPException if already seeded or if conditions are not met.
     """
-    if config.status != "pending":
-        raise HTTPException(status_code=422, detail="Playoff bracket is already active")
+    existing_rounds = db.query(PlayoffRound).filter_by(playoff_config_id=config.id).count()
+    if existing_rounds > 0:
+        raise HTTPException(status_code=422, detail="Playoff bracket is already seeded")
 
     from app.models import League, LeagueTournament, Season, Tournament as TournamentModel
     from app.models.tournament import TournamentStatus
@@ -217,13 +225,14 @@ def seed_playoff(db: Session, config: PlayoffConfig) -> None:
     seeded_members = standings[:playoff_size]
 
     # Create ALL rounds with tournament IDs assigned in date order.
+    # Rounds start in "drafting" status — preferences open immediately upon seeding.
     round_objs: dict[int, PlayoffRound] = {}
     for i, row in enumerate(playoff_rows):
         r = PlayoffRound(
             playoff_config_id=config.id,
             round_number=i + 1,
             tournament_id=row.tournament_id,
-            status="pending",
+            status="drafting",
         )
         db.add(r)
         round_objs[i + 1] = r
@@ -238,7 +247,7 @@ def seed_playoff(db: Session, config: PlayoffConfig) -> None:
         pod = PlayoffPod(
             playoff_round_id=round1.id,
             bracket_position=bp,
-            status="pending",
+            status="drafting",
         )
         db.add(pod)
         pod_map[bp] = pod
@@ -324,21 +333,25 @@ def any_r1_teed_off(db: Session, tournament_id) -> bool:
 
 def open_round_draft(db: Session, playoff_round: PlayoffRound) -> None:
     """
-    Transition a round and all its pods from pending → drafting.
+    Admin override: explicitly transition a round and its pods to "drafting".
 
-    For round 1, if the bracket has not yet been seeded (config.status == "pending"),
-    seeding is performed automatically first using current regular-season standings.
+    In normal flow this is not needed — the bracket is auto-seeded (with all
+    rounds starting as "drafting") when get_bracket detects the schedule has
+    locked. This function exists as a manager safety valve for edge cases
+    (e.g., the auto-seed hasn't run yet, or the round needs to be reopened).
 
-    For rounds > 1, the previous round's tournament must be completed before
-    preferences can open (rule: preferences cannot open before the previous
-    tournament completes).
+    If the round is already "drafting" the call is a no-op.
+    For rounds > 1, the previous round must be completed before calling.
     """
-    config = playoff_round.playoff_config
+    # Already open — nothing to do.
+    if playoff_round.status == "drafting":
+        return
 
-    # Auto-seed when opening round 1 for the first time.
-    if playoff_round.round_number == 1 and config.status == "pending":
-        seed_playoff(db, config)
-        db.refresh(playoff_round)
+    if playoff_round.tournament_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot open draft: no tournament assigned to this round",
+        )
 
     # For round 2+: require the previous round's tournament to be completed.
     if playoff_round.round_number > 1:
@@ -355,8 +368,6 @@ def open_round_draft(db: Session, playoff_round: PlayoffRound) -> None:
                 status_code=422,
                 detail="Previous playoff round not found",
             )
-        # The previous round must be fully completed (scored, advanced) before
-        # opening preferences for the next round.
         if prev_round.status != "completed":
             raise HTTPException(
                 status_code=422,
@@ -365,12 +376,6 @@ def open_round_draft(db: Session, playoff_round: PlayoffRound) -> None:
                     f"round {prev_round.round_number} has not completed yet"
                 ),
             )
-
-    if playoff_round.tournament_id is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Cannot open draft: no tournament assigned to this round",
-        )
 
     playoff_round.status = "drafting"
     for pod in playoff_round.pods:
@@ -407,6 +412,12 @@ def submit_preferences(
     pod = pod_member.pod
     playoff_round = pod.playoff_round
 
+    if pod_member.is_eliminated:
+        raise HTTPException(
+            status_code=403,
+            detail="You have been eliminated from the playoffs and cannot submit picks",
+        )
+
     if playoff_round.status not in ("pending", "drafting"):
         raise HTTPException(
             status_code=422,
@@ -421,7 +432,10 @@ def submit_preferences(
 
     # Preference window closes when the first R1 tee time passes (rule: lock is
     # triggered by the very first tee time, not a specific golfer's tee time).
-    # If tee times are not yet in the DB, fall back to start_date as a safety net.
+    # If tee times are not yet in the DB, fall back to tournament status.
+    # Do NOT use start_date for the fallback — start_date is a calendar date
+    # with no time component, and comparing it to now_utc.date() fires a day
+    # early for US-timezone users (Wednesday night UTC = Thursday date).
     now_utc = datetime.now(timezone.utc)
     first_tee = first_r1_tee_time(db, tournament_id)
     if first_tee is not None:
@@ -431,7 +445,7 @@ def submit_preferences(
                 detail="Preference window is closed — the first golfer has already teed off",
             )
     else:
-        if now_utc.date() >= tournament.start_date:
+        if tournament.status in ("in_progress", "completed"):
             raise HTTPException(
                 status_code=422,
                 detail="Preference window is closed — the tournament has already started",
@@ -484,7 +498,7 @@ def submit_preferences(
 
 def resolve_draft(db: Session, playoff_round: PlayoffRound) -> None:
     """
-    Called by admin after tournament.start_date.
+    Called by admin after the preference window closes (first R1 tee time passes).
     Processes all submitted preference lists in draft order.
     Players with no submitted list get no picks (earn $0).
 
@@ -497,6 +511,23 @@ def resolve_draft(db: Session, playoff_round: PlayoffRound) -> None:
             status_code=422,
             detail="Round is not in drafting status",
         )
+
+    # Guard: preferences cannot be resolved until the submission window has closed.
+    # The window closes when the first Round 1 tee time passes.  If no tee times
+    # are in the DB yet, fall back to tournament status — allow resolution if the
+    # tournament is already in_progress or completed; block if still scheduled.
+    if playoff_round.tournament_id is None:
+        raise HTTPException(status_code=422, detail="No tournament assigned to this round")
+    if not any_r1_teed_off(db, playoff_round.tournament_id):
+        tournament = db.query(Tournament).filter_by(id=playoff_round.tournament_id).first()
+        if tournament and tournament.status not in ("in_progress", "completed"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Cannot resolve preferences yet — the submission window is still open. "
+                    "Wait for the first golfer to tee off before resolving."
+                ),
+            )
 
     config = playoff_round.playoff_config
 
@@ -581,9 +612,24 @@ def score_round(db: Session, playoff_round: PlayoffRound) -> None:
     minus actual assigned picks). Uses league.no_pick_penalty — the same value
     as the regular season penalty, configurable by the league manager.
     """
+    if playoff_round.status != "locked":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Round must be in locked status before scoring — "
+                "resolve the draft first (POST /rounds/{id}/resolve)"
+            ),
+        )
+
     tournament = playoff_round.tournament
     if tournament is None:
         raise HTTPException(status_code=422, detail="No tournament assigned to this round")
+
+    if tournament.status != "completed":
+        raise HTTPException(
+            status_code=422,
+            detail="Tournament must be completed before scoring — wait for official results",
+        )
 
     config = playoff_round.playoff_config
     league = db.query(League).filter_by(id=config.league_id).first()
@@ -600,7 +646,40 @@ def score_round(db: Session, playoff_round: PlayoffRound) -> None:
         else config.picks_per_round[-1]
     )
 
-    multiplier = tournament.multiplier  # Use tournament's global multiplier
+    # Use the league's per-tournament multiplier override if set; otherwise fall
+    # back to the tournament's global multiplier. Mirrors score_picks() in the
+    # scraper so playoff and regular-season scoring are consistent.
+    lt = db.query(LeagueTournament).filter_by(
+        league_id=config.league_id, tournament_id=tournament.id
+    ).first()
+    multiplier = lt.multiplier if lt and lt.multiplier is not None else tournament.multiplier
+
+    # Validate that earnings are published for every assigned pick before modifying
+    # any records.  TournamentEntry.earnings_usd is null until ESPN releases official
+    # prize money; treating null as $0 would produce wrong scores and wrong winners.
+    # If any earnings are missing, abort so the manager can try again later.
+    for pod in playoff_round.pods:
+        for member in pod.members:
+            member_picks = (
+                db.query(PlayoffPick)
+                .filter_by(pod_id=pod.id, pod_member_id=member.id)
+                .all()
+            )
+            for pick in member_picks:
+                entry = (
+                    db.query(TournamentEntry)
+                    .filter_by(tournament_id=tournament.id, golfer_id=pick.golfer_id)
+                    .first()
+                )
+                if entry is not None and entry.earnings_usd is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Earnings are not yet available for all golfers in this round. "
+                            "Please wait for official tournament results to be published "
+                            "and try again."
+                        ),
+                    )
 
     for pod in playoff_round.pods:
         for member in pod.members:
@@ -616,7 +695,7 @@ def score_round(db: Session, playoff_round: PlayoffRound) -> None:
                     .filter_by(tournament_id=tournament.id, golfer_id=pick.golfer_id)
                     .first()
                 )
-                earnings = entry.earnings_usd if entry and entry.earnings_usd else 0
+                earnings = float(entry.earnings_usd) if entry and entry.earnings_usd is not None else 0.0
                 pick.points_earned = earnings * multiplier
                 total += pick.points_earned
 
@@ -668,6 +747,19 @@ def advance_bracket(db: Session, playoff_round: PlayoffRound) -> None:
     After scoring is complete for a round, determine winners and populate
     the next round's pods.
     """
+    if playoff_round.status != "locked":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Round must be in locked status to advance — "
+                + (
+                    "resolve the draft first (POST /rounds/{id}/resolve)."
+                    if playoff_round.status == "drafting"
+                    else "this round has already been advanced."
+                )
+            ),
+        )
+
     # Validate all pods are scored (winner determinable)
     for pod in playoff_round.pods:
         if any(m.total_points is None for m in pod.members):
@@ -687,7 +779,24 @@ def advance_bracket(db: Session, playoff_round: PlayoffRound) -> None:
     )
 
     for pod in playoff_round.pods:
-        winner = _determine_pod_winner(pod)
+        if pod.winner_user_id is not None:
+            # Winner was manually set by override_result before advance_bracket was
+            # called.  Respect the override rather than recalculating from scores.
+            winner = next(
+                (m for m in pod.members if m.user_id == pod.winner_user_id),
+                None,
+            )
+            if winner is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Pod {pod.id} has an override winner that is not a pod member — "
+                        "please correct the override before advancing."
+                    ),
+                )
+        else:
+            winner = _determine_pod_winner(pod)
+
         pod.winner_user_id = winner.user_id
         pod.status = "completed"
 
@@ -710,7 +819,7 @@ def advance_bracket(db: Session, playoff_round: PlayoffRound) -> None:
                 next_pod = PlayoffPod(
                     playoff_round_id=next_round.id,
                     bracket_position=next_bracket_position,
-                    status="pending",
+                    status="drafting",
                 )
                 db.add(next_pod)
                 db.flush()
@@ -736,6 +845,8 @@ def advance_bracket(db: Session, playoff_round: PlayoffRound) -> None:
         # Flush so the new pod members are visible for re-sort
         db.flush()
         _normalize_draft_positions(db, next_round)
+        # Auto-open preference window for the next round — no manager action needed.
+        next_round.status = "drafting"
 
     db.commit()
 
@@ -747,8 +858,56 @@ def advance_bracket(db: Session, playoff_round: PlayoffRound) -> None:
 def override_result(db: Session, pod: PlayoffPod, winner_user_id: uuid.UUID) -> None:
     """
     Manager safety valve: manually set the winner of a pod.
-    Bypasses all scoring logic.
+
+    Only valid after:
+      1. The playoff tournament has completed (individual pick revision is closed).
+      2. The round has been scored (score_round has been run) so total_points are set.
+      3. The bracket has NOT yet been advanced (round.status is still "locked").
+
+    Once advance_bracket is called the result is permanently locked and cannot
+    be overridden. Use the individual pick-revision endpoint (PATCH /picks/{id})
+    to correct golfer assignments while the tournament is still in_progress.
     """
+    playoff_round = pod.playoff_round
+
+    # Rule: override only after the tournament has completed.
+    tournament = (
+        db.query(Tournament).filter_by(id=playoff_round.tournament_id).first()
+        if playoff_round.tournament_id
+        else None
+    )
+    if tournament is None or tournament.status != "completed":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Pod winner can only be overridden after the tournament has completed. "
+                "Use individual pick revision while the tournament is in progress."
+            ),
+        )
+
+    # Rule: round must be "locked" — draft resolved, bracket not yet advanced.
+    if playoff_round.status != "locked":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Pod winner override is only available for rounds that have been resolved "
+                "but not yet advanced. "
+                + (
+                    "Resolve the draft first (POST /rounds/{id}/resolve)."
+                    if playoff_round.status == "drafting"
+                    else "The bracket has already been advanced — this round is permanently locked."
+                )
+            ),
+        )
+
+    # Rule: scoring must have run — total_points must be set for all members
+    # so that the manager can make an informed override decision.
+    if any(m.total_points is None for m in pod.members):
+        raise HTTPException(
+            status_code=422,
+            detail="Score the round first (POST /rounds/{id}/score) before overriding the winner.",
+        )
+
     # Validate the winner is actually a member of this pod
     winner_member = next(
         (m for m in pod.members if m.user_id == winner_user_id),
@@ -764,7 +923,10 @@ def override_result(db: Session, pod: PlayoffPod, winner_user_id: uuid.UUID) -> 
     pod.status = "completed"
 
     for member in pod.members:
-        if member.user_id != winner_user_id:
+        if member.user_id == winner_user_id:
+            # Explicitly reset in case a previous override had marked this member eliminated.
+            member.is_eliminated = False
+        else:
             member.is_eliminated = True
 
     db.commit()

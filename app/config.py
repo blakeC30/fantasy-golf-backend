@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     # The frontend origin that is allowed to make cross-origin requests to the API.
     FRONTEND_URL: str = "http://localhost:5173"
 
+    # --- AWS / SES ---
+    # Region where SES is configured.
+    AWS_REGION: str = "us-east-1"
+    # Credentials — leave empty in production to use the EC2 IAM instance role.
+    # Set to "test" when pointing at LocalStack.
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    # Override the AWS endpoint URL. Empty = real AWS. Set to http://localstack:4566 in Docker dev.
+    AWS_ENDPOINT_URL: str = ""
+    # The verified sender address in SES. Must be verified in the AWS console before going to prod.
+    SES_FROM_EMAIL: str = "noreply@league-caddie.com"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

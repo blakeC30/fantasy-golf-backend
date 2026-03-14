@@ -14,12 +14,13 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import and_, func as sqlfunc, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
+from app.limiter import limiter
 from app.dependencies import (
     get_active_season,
     get_current_user,
@@ -33,6 +34,8 @@ from app.models import (
     LeagueMemberStatus,
     LeagueTournament,
     Pick,
+    PlayoffConfig,
+    PlayoffRound,
     Season,
     Tournament,
     TournamentEntry,
@@ -92,7 +95,9 @@ def _picks_with_relations(query):
 
 
 @router.post("", response_model=PickOut, status_code=201)
+@limiter.limit("30/hour")
 def submit_pick(
+    request: Request,
     body: PickCreate,
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
     season: Season = Depends(get_active_season),
@@ -331,7 +336,9 @@ def get_tournament_picks_summary(
 
 
 @router.patch("/{pick_id}", response_model=PickOut)
+@limiter.limit("30/hour")
 def change_pick(
+    request: Request,
     pick_id: uuid.UUID,
     body: PickUpdate,
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
@@ -395,8 +402,11 @@ def admin_override_pick(
     - golfer_id provided → upsert the pick (create or replace existing)
     - golfer_id null     → delete the pick if it exists
 
-    No deadline or no-repeat validation is applied — this is a commissioner
-    override and intentionally bypasses the normal pick rules.
+    Bypassed rules: pick deadline, field eligibility (golfer does not need a
+    TournamentEntry record — the field may not be released yet).
+
+    Still enforced: the no-repeat rule. A manager cannot assign a golfer the
+    member has already used in a different regular season tournament this season.
     """
     league, _ = league_and_manager
 
@@ -408,6 +418,58 @@ def admin_override_pick(
     )
     if not lt:
         raise HTTPException(status_code=422, detail="Tournament is not in this league's schedule")
+
+    # Block admin override for playoff-designated tournaments — those picks live in
+    # PlayoffPick rows and are managed through the playoff bracket endpoints.
+    is_playoff_tournament = (
+        db.query(PlayoffRound)
+        .join(PlayoffConfig, PlayoffRound.playoff_config_id == PlayoffConfig.id)
+        .filter(
+            PlayoffConfig.league_id == league.id,
+            PlayoffConfig.season_id == season.id,
+            PlayoffRound.tournament_id == body.tournament_id,
+        )
+        .first()
+    ) is not None
+    if is_playoff_tournament:
+        raise HTTPException(
+            status_code=422,
+            detail="This is a playoff tournament — manage picks through the playoff bracket endpoints",
+        )
+
+    # Block once the regular season is over. The regular season is considered locked
+    # when the last non-playoff tournament in the league's schedule has completed.
+    playoff_tournament_ids: set = set()
+    config = (
+        db.query(PlayoffConfig)
+        .filter_by(league_id=league.id, season_id=season.id)
+        .first()
+    )
+    if config:
+        playoff_tournament_ids = {
+            row.tournament_id
+            for row in db.query(PlayoffRound.tournament_id)
+            .filter(
+                PlayoffRound.playoff_config_id == config.id,
+                PlayoffRound.tournament_id.isnot(None),
+            )
+            .all()
+        }
+    last_regular_season = (
+        db.query(Tournament)
+        .join(LeagueTournament, LeagueTournament.tournament_id == Tournament.id)
+        .filter(
+            LeagueTournament.league_id == league.id,
+            Tournament.id.notin_(playoff_tournament_ids) if playoff_tournament_ids else True,
+        )
+        .order_by(Tournament.start_date.desc())
+        .first()
+    )
+    if last_regular_season and last_regular_season.status == TournamentStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=422,
+            detail="The regular season has ended — pick records are permanently locked",
+        )
 
     # Verify the target user is an approved member of this league
     membership = (
@@ -437,14 +499,30 @@ def admin_override_pick(
             db.commit()
         return None
 
-    # Verify golfer is in the tournament field
-    entry = (
-        db.query(TournamentEntry)
-        .filter_by(tournament_id=body.tournament_id, golfer_id=body.golfer_id)
+    # Verify the golfer exists in the database (field eligibility is intentionally bypassed —
+    # the manager can override before the official field is released).
+    golfer = db.query(Golfer).filter_by(id=body.golfer_id).first()
+    if not golfer:
+        raise HTTPException(status_code=404, detail="Golfer not found")
+
+    # No-repeat rule is enforced for admin overrides. A manager cannot assign a golfer
+    # the member has already used in a different tournament this season.
+    no_repeat_conflict = (
+        db.query(Pick)
+        .filter(
+            Pick.league_id == league.id,
+            Pick.season_id == season.id,
+            Pick.user_id == body.user_id,
+            Pick.golfer_id == body.golfer_id,
+            Pick.tournament_id != body.tournament_id,  # exclude the tournament being overridden
+        )
         .first()
     )
-    if not entry:
-        raise HTTPException(status_code=422, detail="Golfer is not in the tournament field")
+    if no_repeat_conflict:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{golfer.name} has already been used by this member in another tournament this season",
+        )
 
     tournament = db.query(Tournament).filter_by(id=body.tournament_id).first()
 

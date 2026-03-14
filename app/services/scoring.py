@@ -16,7 +16,7 @@ import datetime
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import League, LeagueMember, LeagueMemberStatus, LeagueTournament, Pick, Season, Tournament, TournamentStatus
+from app.models import League, LeagueMember, LeagueMemberStatus, LeagueTournament, Pick, PlayoffConfig, PlayoffRound, Season, Tournament, TournamentStatus
 
 
 def calculate_standings(db: Session, league: League, season: Season) -> list[dict]:
@@ -44,7 +44,24 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
         )
         .all()
     )
-    completed_ids = {t.id for t in season_tournaments}
+
+    # Exclude playoff tournaments — playoff members play via PlayoffPick, not
+    # Pick, so they have no regular-season Pick records for those weeks. Without
+    # this exclusion they'd receive spurious no-pick penalties in the standings.
+    config = db.query(PlayoffConfig).filter_by(league_id=league.id, season_id=season.id).first()
+    playoff_tournament_ids: set = set()
+    if config:
+        rows = (
+            db.query(PlayoffRound.tournament_id)
+            .filter(
+                PlayoffRound.playoff_config_id == config.id,
+                PlayoffRound.tournament_id.isnot(None),
+            )
+            .all()
+        )
+        playoff_tournament_ids = {row.tournament_id for row in rows}
+
+    completed_ids = {t.id for t in season_tournaments if t.id not in playoff_tournament_ids}
 
     # Only approved members appear in standings — pending requests are excluded.
     members = (

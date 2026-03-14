@@ -72,8 +72,6 @@ class League(Base):
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
-
     # Unique, unguessable token used in the invite URL (/join/{invite_code}).
     # Generated once at creation; admins share this URL with prospective members.
     # Stored as a 22-character URL-safe base64 string (128 bits of entropy).

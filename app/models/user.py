@@ -23,6 +23,7 @@ from app.models.base import Base
 
 if TYPE_CHECKING:
     from app.models.league import League, LeagueMember
+    from app.models.password_reset_token import PasswordResetToken
     from app.models.pick import Pick
 
 
@@ -73,6 +74,9 @@ class User(Base):
     # without writing extra queries.
     league_memberships: Mapped[list["LeagueMember"]] = relationship(back_populates="user")
     picks: Mapped[list["Pick"]] = relationship(back_populates="user")
+    password_reset_tokens: Mapped[list["PasswordResetToken"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     created_leagues: Mapped[list["League"]] = relationship(
         back_populates="created_by_user",
         foreign_keys="League.created_by",

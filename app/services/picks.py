@@ -29,7 +29,7 @@ from fastapi import HTTPException
 from sqlalchemy import func as sqlfunc
 from sqlalchemy.orm import Session
 
-from app.models import Golfer, LeagueTournament, Pick, Season, Tournament, TournamentEntry, TournamentStatus
+from app.models import Golfer, LeagueTournament, Pick, PlayoffConfig, PlayoffRound, Season, Tournament, TournamentEntry, TournamentStatus
 
 
 def validate_new_pick(
@@ -58,6 +58,25 @@ def validate_new_pick(
             detail="This tournament is not in your league's schedule",
         )
 
+    # Block regular picks for playoff-designated tournaments. Playoff rounds use
+    # a preference/draft mechanism (PlayoffPick rows), not regular Pick records.
+    # Allowing a regular pick here would create a ghost record that doesn't count
+    # in standings but would still consume the golfer under the no-repeat rule.
+    playoff_round = (
+        db.query(PlayoffRound)
+        .join(PlayoffConfig, PlayoffRound.playoff_config_id == PlayoffConfig.id)
+        .filter(
+            PlayoffConfig.league_id == league_id,
+            PlayoffRound.tournament_id == tournament_id,
+        )
+        .first()
+    )
+    if playoff_round:
+        raise HTTPException(
+            status_code=422,
+            detail="This is a playoff tournament — submit your ranked preferences via the playoff bracket instead",
+        )
+
     if tournament.status == TournamentStatus.COMPLETED.value:
         raise HTTPException(status_code=400, detail="Tournament is already completed")
 
@@ -79,6 +98,46 @@ def validate_new_pick(
                 status_code=400,
                 detail=f"Picks for this tournament are not available until '{active.name}' completes",
             )
+
+        # Block if the most recently completed tournament's earnings haven't been
+        # published by ESPN yet.  score_picks() caches earnings in
+        # TournamentEntry.earnings_usd; a null value means ESPN hasn't released
+        # official prize money yet and the standings would be incorrect.
+        last_completed = (
+            db.query(Tournament)
+            .join(LeagueTournament, LeagueTournament.tournament_id == Tournament.id)
+            .filter(
+                LeagueTournament.league_id == league_id,
+                Tournament.status == TournamentStatus.COMPLETED.value,
+            )
+            .order_by(Tournament.start_date.desc())
+            .first()
+        )
+        if last_completed:
+            pick_golfer_ids_sq = (
+                db.query(Pick.golfer_id)
+                .filter(
+                    Pick.league_id == league_id,
+                    Pick.tournament_id == last_completed.id,
+                )
+            )
+            unfinalized = (
+                db.query(TournamentEntry)
+                .filter(
+                    TournamentEntry.tournament_id == last_completed.id,
+                    TournamentEntry.golfer_id.in_(pick_golfer_ids_sq),
+                    TournamentEntry.earnings_usd.is_(None),
+                )
+                .first()
+            )
+            if unfinalized:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Results for '{last_completed.name}' are still being finalized. "
+                        "Please try again once official earnings are published."
+                    ),
+                )
 
     if tournament.status not in (
         TournamentStatus.SCHEDULED.value,
@@ -113,11 +172,28 @@ def validate_new_pick(
             )
 
     if tournament.status == TournamentStatus.SCHEDULED.value:
-        if tournament.start_date <= date.today():
-            raise HTTPException(
-                status_code=400,
-                detail="Pick deadline has passed — the tournament has already started",
-            )
+        now = datetime.now(timezone.utc)
+        if entry is not None and entry.tee_time is not None:
+            # Tee times are published — use the golfer's actual R1 tee time as the
+            # deadline, matching the rule exactly: "the pick locks when the picked
+            # golfer's Round 1 tee time passes." This unblocks late picks on
+            # tournament day when the scraper hasn't yet flipped status to IN_PROGRESS.
+            if entry.tee_time <= now:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pick deadline has passed — golfer has already teed off",
+                )
+        else:
+            # Tee times not yet available — fall back to start_date as the proxy.
+            # start_date is a calendar date (no time component), so comparing it to
+            # date.today() (server UTC) is correct: once the tournament day arrives,
+            # picks are blocked until tee times are synced and the specific golfer's
+            # time can be checked.
+            if tournament.start_date <= date.today():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pick deadline has passed — the tournament has already started",
+                )
     else:
         # IN_PROGRESS: field must be released and the golfer must not have teed off.
         now = datetime.now(timezone.utc)

@@ -124,6 +124,13 @@ class Tournament(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # Set by the scraper at the very end of each sync_tournament call, after all
+    # upserts and pick scoring are committed. The frontend polls this value to
+    # detect when a sync has fully completed before refreshing the leaderboard.
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # --- Relationships ---
     entries: Mapped[list["TournamentEntry"]] = relationship(
         back_populates="tournament"

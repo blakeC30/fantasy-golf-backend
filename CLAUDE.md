@@ -9,7 +9,9 @@ FastAPI + Python + SQLAlchemy 2.0 app. See the root `CLAUDE.md` for project-wide
 - **Alembic** — migrations (see Migration section below)
 - **PostgreSQL** — primary DB
 - **httpx** — sync HTTP client for ESPN API calls
-- **APScheduler** (`BackgroundScheduler`) — daily sync jobs in thread pool, started in FastAPI lifespan
+- **APScheduler** (`BackgroundScheduler`) — time-driven sync jobs (schedule, field, live scores, finalization)
+- **boto3** — AWS SDK; SQS client for publishing events (scraper) and consuming them (worker)
+- **SQS** — event queue for playoff automation; LocalStack used locally (same code as production)
 - **Ruff** — linting + formatting
 - **pytest** — test runner
 
@@ -21,6 +23,8 @@ app/
 ├── config.py         # Pydantic BaseSettings — reads .env; singleton `settings`
 ├── database.py       # SQLAlchemy engine + SessionLocal + get_db() dependency
 ├── dependencies.py   # FastAPI dependency functions (auth chain, league access chain)
+├── scraper_main.py   # Scraper container entrypoint — starts APScheduler, blocks on signal
+├── worker_main.py    # Worker container entrypoint — runs SQS consumer loop
 ├── models/           # SQLAlchemy ORM models
 │   ├── user.py       # User
 │   ├── league.py     # League, LeagueMember, LeagueMemberStatus, Season
@@ -48,11 +52,13 @@ app/
 │   ├── playoff.py    # /leagues/{league_id}/playoff/* (config, bracket, draft, pods)
 │   └── admin.py      # /admin/* (platform admin only)
 └── services/
-    ├── auth.py       # hash_password, verify_password, create/decode JWT tokens, verify_google_id_token
+    ├── auth.py       # hash_password, verify_password, create/decode JWT tokens, verify_google_id_token, generate/validate/consume_reset_token
+    ├── email.py      # send_password_reset_email — AWS SES (LocalStack locally, real SES in prod)
     ├── picks.py      # validate_new_pick(), validate_pick_change(), all_r1_teed_off() — raises HTTPException
     ├── scoring.py    # calculate_standings() — returns list[dict]
-    ├── scraper.py    # ESPN API client, upsert functions, full_sync / sync_tournament
-    ├── scheduler.py  # APScheduler setup — starts on FastAPI startup, runs scraper jobs
+    ├── scraper.py    # ESPN API client, upsert functions, full_sync / sync_tournament; publishes SQS events at status transitions
+    ├── scheduler.py  # APScheduler setup — time-driven jobs only (schedule, field, live, finalization)
+    ├── sqs.py        # boto3 SQS wrapper: publish(event_type, **payload) and consume(handler) — LocalStack locally, real SQS in prod
     └── playoff.py    # seed_playoff, resolve_draft, score_round, advance_bracket, override_result
 
 alembic/
@@ -76,6 +82,8 @@ All routes are prefixed with `/api/v1`.
 | POST | `/auth/google` | — | Google ID token → JWT pair |
 | POST | `/auth/refresh` | cookie | Returns new access_token |
 | POST | `/auth/logout` | token | Clears refresh cookie |
+| POST | `/auth/forgot-password` | — | Send password reset email; always 200 (no email enumeration); 3/hour rate limit |
+| POST | `/auth/reset-password` | — | Validate reset token, set new password, auto-login; 10/hour rate limit |
 | GET | `/users/me` | token | Current user profile |
 | PATCH | `/users/me` | token | Update display_name |
 | GET | `/users/me/leagues` | token | User's approved leagues |
@@ -84,7 +92,7 @@ All routes are prefixed with `/api/v1`.
 | GET | `/leagues/my-requests` | token | User's pending requests |
 | POST | `/leagues/join/{invite_code}` | token | Submit join request |
 | GET | `/leagues/{league_id}` | member | League details |
-| PATCH | `/leagues/{league_id}` | manager | Update name/description/penalty |
+| PATCH | `/leagues/{league_id}` | manager | Update name/penalty |
 | GET | `/leagues/{league_id}/members` | member | Approved members only |
 | PATCH | `/leagues/{league_id}/members/{user_id}/role` | manager | |
 | DELETE | `/leagues/{league_id}/members/{user_id}` | manager | |
@@ -97,6 +105,8 @@ All routes are prefixed with `/api/v1`.
 | GET | `/tournaments` | token | All/filtered by status |
 | GET | `/tournaments/{id}` | token | Tournament details |
 | GET | `/tournaments/{id}/field` | token | Golfers in field — returns `GolferInFieldOut[]` (includes `tee_time`); WD golfers excluded; all others returned regardless of status so frontend can grey out teed-off golfers |
+| GET | `/tournaments/{id}/leaderboard` | token | Full leaderboard with per-round data; includes `last_synced_at` (UTC ISO timestamp or null) set at end of each `sync_tournament` run |
+| GET | `/tournaments/{id}/sync-status` | token | Lightweight: `{tournament_id, tournament_status, last_synced_at}` — poll every 30 s to detect new syncs without fetching full leaderboard |
 | GET | `/golfers` | token | List/search golfers |
 | GET | `/golfers/{id}` | token | Golfer details |
 | POST | `/leagues/{league_id}/picks` | member | Submit pick |
@@ -110,7 +120,7 @@ All routes are prefixed with `/api/v1`.
 | GET | `/leagues/{league_id}/playoff/config` | member | Get playoff config |
 | PATCH | `/leagues/{league_id}/playoff/config` | manager | Update config (only when status=pending) |
 | GET | `/leagues/{league_id}/playoff/bracket` | member | Full bracket — all rounds, pods, picks |
-| POST | `/leagues/{league_id}/playoff/rounds/{round_id}/open` | manager | Open draft (auto-seeds bracket on round 1 when status=pending; pending→drafting) |
+| POST | `/leagues/{league_id}/playoff/rounds/{round_id}/open` | manager | Admin override: explicitly open draft for a round (no-op if already drafting). In normal flow this is not needed — bracket is auto-seeded when schedule locks and rounds start as "drafting"; subsequent rounds auto-open after advance |
 | POST | `/leagues/{league_id}/playoff/rounds/{round_id}/resolve` | manager | Process preferences → picks (drafting→locked) |
 | POST | `/leagues/{league_id}/playoff/rounds/{round_id}/score` | manager | Populate points_earned from tournament results |
 | POST | `/leagues/{league_id}/playoff/rounds/{round_id}/advance` | manager | Determine winners, create next-round pods |
@@ -169,7 +179,8 @@ Always call `db.commit()` explicitly. Never rely on auto-commit. Use `db.refresh
 | Table | Key Columns |
 |-------|-------------|
 | `users` | id (UUID), email (unique), password_hash (nullable), google_id (nullable), display_name, is_platform_admin |
-| `leagues` | id (UUID), name, invite_code (unique, 16-char token), is_public, no_pick_penalty (default=-50000) |
+| `password_reset_tokens` | id (UUID), user_id (FK→users, CASCADE), token_hash (SHA-256 hex, indexed), expires_at, used_at (nullable — set on redemption), created_at |
+| `leagues` | id (UUID), name, invite_code (unique, 16-char token), is_public, no_pick_penalty (default=-50000) — no description column |
 | `league_members` | league_id, user_id, role ("manager"\|"member"), status ("pending"\|"approved") |
 | `seasons` | league_id, year (int), is_active; UNIQUE(league_id, year) |
 | `tournaments` | pga_tour_id (unique), name, start_date, end_date, multiplier (float, default=1.0), status, competition_id (nullable), is_team_event (bool) |
@@ -220,6 +231,9 @@ Existing migration files (in order):
 13. `d4f6a2e8b1c9` — add `league_tournaments.is_playoff` (bool, default false)
 14. `e5f1a9b2c3d4` — drop `league_tournaments.is_playoff` — playoff rounds are now auto-selected as the last N scheduled tournaments in the league's schedule
 15. `e5g9b3c7f2a1` — replace `playoff_configs.round1_picks_per_player` + `subsequent_picks_per_player` with `picks_per_round` (JSONB int array, one element per round)
+16. `g3h5i7j9k1l2` — drop `leagues.description` column
+17. `h4i6j8k0l2m3` — add `tournaments.last_synced_at` (DateTime, nullable) — set by scraper after each full sync_tournament completes
+18. `i5j7k9l1m3n5` — add `password_reset_tokens` table (forgot-password flow)
 
 New migrations still go in `alembic/versions/` with correct `down_revision` chaining, but are applied manually via psql.
 
@@ -239,33 +253,51 @@ ESPN unofficial API — no auth required, but undocumented and may change.
 
 Manual trigger via `POST /admin/sync` (calls scraper functions directly, works from either container).
 
-## Scraper Container Architecture
+## Container Architecture
 
-The scraper runs as a **separate container** from the API. This isolates scraper failures from API availability and lets both be deployed independently.
-
-| Container | Entrypoint | Dockerfile target |
+| Container | Entrypoint | Purpose |
 |---|---|---|
-| API | `app/main.py` (uvicorn) | `--target api` |
-| Scraper | `app/scraper_main.py` | `--target scraper` |
+| API | `app/main.py` (uvicorn) | HTTP API — no scheduler, no SQS |
+| Scraper | `app/scraper_main.py` | APScheduler time-driven sync jobs; publishes SQS events |
+| Worker | `app/worker_main.py` | SQS consumer loop; handles playoff finalization |
+| Postgres | — | Database |
+| LocalStack | — | Local SQS emulation (dev only, docker-compose) |
 
-Both containers connect to the same PostgreSQL DB. The scraper only writes; it serves no HTTP requests.
+All containers connect to the same PostgreSQL DB. The scraper only writes; it serves no HTTP requests. The worker only consumes from SQS and writes to the DB.
 
-### Scheduler Jobs (in `app/services/scheduler.py`)
+### APScheduler Jobs (in `app/services/scheduler.py`)
 
 All scheduling is **status-driven, not calendar-driven** — no hardcoded weekdays.
 
 | Job ID | Schedule | Trigger condition |
 |---|---|---|
-| `schedule_sync` | Daily 06:00 UTC | Always |
+| `schedule_sync` | Daily 06:00 UTC | Always — publishes `TOURNAMENT_COMPLETED` SQS events for status transitions |
 | `field_sync_d2` | Daily 14:00 UTC | Tournament starts in 2 days |
 | `field_sync_d1` | Daily 18:00 UTC | Tournament starts tomorrow |
 | `field_sync_d0` | Daily 11:00 UTC | Tournament starts today |
-| `live_score_sync` | Every 10 minutes | `tournament.status == "in_progress"` AND within play window |
-| `results_finalization` | Daily 09:00, 15:00, 21:00 UTC | Completed tournament with unscored picks |
+| `live_score_sync` | Every 5 minutes | `tournament.status == "in_progress"` AND within play window; publishes `TOURNAMENT_IN_PROGRESS` while playoff rounds are unresolved |
+| `results_finalization` | Daily 09:00, 15:00, 21:00 UTC | Completed tournament with unscored picks (safety net — SQS worker is primary) |
 
 **Live sync play window:** Computed from `tournament_entry_rounds.tee_time` values stored in the DB (UTC-aware). If no tee times yet: wide fallback `[10:00–07:00 UTC]` covers all PGA Tour locations (US East through Hawaii). No day-of-week restriction — Monday weather carryovers continue syncing automatically.
 
-**Results finalization:** 3× daily so any finish time on any day is caught (Sunday night, Monday, or Tuesday delays).
+**Results finalization:** 3× daily so any finish time on any day is caught. Acts as a safety net if the SQS `TOURNAMENT_COMPLETED` pipeline missed anything.
+
+### SQS Worker (in `app/worker_main.py`)
+
+The worker handles event-triggered operations that don't belong on a clock.
+
+| Event | Published by | Consumer action |
+|---|---|---|
+| `TOURNAMENT_IN_PROGRESS` | `sync_tournament()` (every 5 min while in_progress + unresolved rounds) | `resolve_draft()` for any "drafting" playoff rounds once `any_r1_teed_off()` returns True |
+| `TOURNAMENT_COMPLETED` | `sync_schedule()` on status transition | `score_picks()` → `score_round()` → `advance_bracket()` in order |
+
+All handlers are **idempotent** — SQS at-least-once delivery is safe. The visibility timeout (120 s) prevents two worker pods from processing the same message simultaneously.
+
+**Local dev:** LocalStack emulates SQS locally. Queue auto-created by `localstack-init/create-queues.sh`. Set `SQS_QUEUE_URL` env var (see docker-compose.yml). If `SQS_QUEUE_URL` is unset, publish calls are silently skipped.
+
+**Production:** EC2 instance profile provides SQS credentials — no access keys in env vars. `AWS_ENDPOINT_URL` is absent in production; boto3 uses real AWS. Queue names: `fantasy-golf-events` / `fantasy-golf-events-dlq`. See `SQS.md` in the project root for AWS setup steps.
+
+**DLQ monitoring:** After 3 failed delivery attempts a message moves to the DLQ. Non-zero DLQ depth means a finalization step failed permanently and needs manual investigation.
 
 ## Testing
 

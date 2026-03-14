@@ -91,6 +91,11 @@ _SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/golf/pga/scoreb
 _CORE_API_BASE = "https://sports.core.api.espn.com/v2/sports/golf/leagues/pga"
 _REQUEST_TIMEOUT = 30.0  # seconds
 
+# Sent with every ESPN request. Accept-Encoding: gzip is honoured by both ESPN
+# endpoints (site API and core API) and httpx decompresses transparently,
+# reducing payload size by ~80%.
+_ESPN_HEADERS = {"Accept-Encoding": "gzip"}
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -103,7 +108,7 @@ def _get_json(url: str, params: dict | None = None) -> dict:
     Uses a short-lived httpx.Client (connection pooling within one call).
     Raises httpx.HTTPStatusError on 4xx/5xx, httpx.RequestError on network failure.
     """
-    with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+    with httpx.Client(timeout=_REQUEST_TIMEOUT, headers=_ESPN_HEADERS) as client:
         resp = client.get(url, params=params or {})
         resp.raise_for_status()
         return resp.json()
@@ -119,7 +124,7 @@ def _fetch_athlete_info(athlete_id: str) -> dict:
     """
     url = f"{_CORE_API_BASE}/athletes/{athlete_id}"
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=10.0, headers=_ESPN_HEADERS) as client:
             resp = client.get(url)
             if resp.status_code == 200:
                 d = resp.json()
@@ -199,7 +204,7 @@ def _fetch_competitor_rounds(
         f"/competitions/{competition_id}/competitors/{athlete_id}/linescores"
     )
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=10.0, headers=_ESPN_HEADERS) as client:
             resp = client.get(url)
             if resp.status_code != 200:
                 return athlete_id, []
@@ -271,19 +276,57 @@ def _fetch_competitor_rounds(
         position: str | None = str(raw_pos) if raw_pos is not None else None
 
         # Count completed holes from the nested linescores array.
-        # Only count holes with a real (non-zero) score — ESPN may include
-        # 0-value placeholders for holes not yet played.
+        # ESPN hole-level `value` is score-to-par (-1=birdie, 0=par, +1=bogey),
+        # NOT raw strokes. This means value=0 is valid for a played par hole AND
+        # for an unplayed placeholder, so we cannot use value==0 to detect
+        # unplayed holes. Instead we use `displayValue`: played holes always have
+        # a non-empty displayValue (e.g. "E" for par, "-1" for birdie), while
+        # unplayed placeholder entries have displayValue=None or displayValue="".
         # "thru" = 0 means the round is scheduled but not started; 18 = complete.
+        #
+        # Important: ESPN returns hole-by-hole linescores only for the current
+        # live round. For already-completed rounds in an active tournament, ESPN
+        # returns the round summary (score, score_to_par) but an empty or absent
+        # linescores array. Without this fix, thru would compute to None, leaving
+        # any previously stored stale value (e.g. 17 from a mid-round sync)
+        # unchanged in the DB. Fix: if ESPN provides a round-level score but no
+        # hole data, the round is complete — set thru = 18 unconditionally.
         linescores = item.get("linescores", [])
-        played = [h for h in linescores if h.get("value") not in (None, 0, "0")]
-        thru: int | None = len(played) if linescores else None
+        played = [h for h in linescores if h.get("displayValue") not in (None, "")]
+        if linescores:
+            # Hole data present — count played holes normally.
+            thru: int | None = len(played)
+        elif score is not None or score_to_par is not None:
+            # No hole data but round has summary data (strokes or score-to-par)
+            # → ESPN only omits linescores for completed rounds → mark as complete.
+            thru = 18
+        else:
+            # No hole data, no summary data → round is upcoming or not started.
+            thru = None
 
-        # Detect back-nine starts: if the first played hole is >= 10 the golfer
-        # started on the back nine (displayed as e.g. "8*" on the leaderboard).
+        # Detect back-nine starts: the first hole in the linescores array (in
+        # playing order) has period >= 10 for back-nine starters.  Prefer the
+        # first *played* hole (most accurate); fall back to the first placeholder
+        # entry (displayValue="") which ESPN includes in playing order before the
+        # round begins, allowing back-nine detection before a player has teed off.
         started_on_back: bool | None = None
-        if played:
+        ref_hole = played[0] if played else (linescores[0] if linescores else None)
+        if ref_hole:
             try:
-                started_on_back = int(played[0].get("period")) >= 10
+                started_on_back = int(ref_hole.get("period")) >= 10
+            except (TypeError, ValueError):
+                pass
+
+        # Track whether any linescore entry is a back-nine hole (period >= 10).
+        # When a back-nine starter crosses to the front nine, ESPN resets the
+        # linescores array to show only the current 9 (front-nine) holes.
+        # Knowing whether back-nine holes were present lets us correct thru later.
+        _has_back_nine_linescore = False
+        for _h in linescores:
+            try:
+                if int(_h.get("period")) >= 10:
+                    _has_back_nine_linescore = True
+                    break
             except (TypeError, ValueError):
                 pass
 
@@ -296,6 +339,7 @@ def _fetch_competitor_rounds(
             "is_playoff": is_playoff,
             "thru": thru,
             "started_on_back": started_on_back,
+            "_has_back_nine_linescore": _has_back_nine_linescore,
         })
 
     return athlete_id, rounds
@@ -305,32 +349,45 @@ def _fetch_competitor_status(
     event_id: str,
     competition_id: str,
     competitor_id: str,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, int | None, int | None]:
     """
-    Fetch a competitor's final status from the ESPN /status sub-endpoint.
+    Fetch a competitor's current status from the ESPN /status sub-endpoint.
 
-    Returns (competitor_id, short_detail) where short_detail is one of:
-      "F"   → finished normally (active, no special status)
-      "WD"  → withdrew before or during the tournament
-      "CUT" → missed the cut after round 2
-      "MDF" → made the cut, did not finish (rare format-specific cut)
-      "DQ"  → disqualified
-      None  → fetch failed or status unrecognised
+    Returns (competitor_id, short_detail, current_round, start_hole) where:
+      short_detail is one of:
+        "F"   → finished normally (active, no special status)
+        "WD"  → withdrew before or during the tournament
+        "CUT" → missed the cut after round 2
+        "MDF" → made the cut, did not finish (rare format-specific cut)
+        "DQ"  → disqualified
+        None  → fetch failed or status unrecognised
+      current_round is the ESPN "period" (round number) from the status response.
+      start_hole is the hole number the golfer tees off from for the current round
+        (1–9 = front nine, 10–18 = back nine). None if not available.
     """
     url = (
         f"{_CORE_API_BASE}/events/{event_id}"
         f"/competitions/{competition_id}/competitors/{competitor_id}/status"
     )
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=10.0, headers=_ESPN_HEADERS) as client:
             resp = client.get(url)
             if resp.status_code != 200:
-                return competitor_id, None
+                return competitor_id, None, None, None
             data = resp.json()
-            return competitor_id, data.get("type", {}).get("shortDetail")
+            short_detail = data.get("type", {}).get("shortDetail")
+            try:
+                current_round = int(data["period"]) if data.get("period") is not None else None
+            except (TypeError, ValueError):
+                current_round = None
+            try:
+                start_hole = int(data["startHole"]) if data.get("startHole") is not None else None
+            except (TypeError, ValueError):
+                start_hole = None
+            return competitor_id, short_detail, current_round, start_hole
     except httpx.RequestError as exc:
         log.warning("Could not fetch status for competitor %s: %s", competitor_id, exc)
-        return competitor_id, None
+        return competitor_id, None, None, None
 
 
 def _fetch_tournament_data(
@@ -420,10 +477,13 @@ def _fetch_tournament_data(
             pga_tour_id, len(rounds_by_athlete), non_empty,
         )
 
-    # Step 4 (optional): fetch per-competitor status (WD / CUT / DQ / MDF / F).
+    # Step 4 (optional): fetch per-competitor status (WD / CUT / DQ / MDF / F)
+    # and current-round startHole (for back-nine detection before tee-off).
     # Only fetched when round data is fetched (i.e. full sync, not schedule-only).
     _NOTABLE_STATUSES = {"WD", "CUT", "MDF", "DQ"}
     status_by_athlete: dict[str, str | None] = {}
+    # Maps athlete_id → (current_round_number, start_hole) from the status endpoint.
+    start_hole_by_athlete: dict[str, tuple[int, int]] = {}
     if fetch_round_data and all_athlete_ids:
         with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
             futures_st = {
@@ -432,9 +492,11 @@ def _fetch_tournament_data(
             }
             for future in concurrent.futures.as_completed(futures_st):
                 try:
-                    aid, short_detail = future.result()
+                    aid, short_detail, current_round, start_hole = future.result()
                     # Only store notable non-active statuses; active/finished = None.
                     status_by_athlete[aid] = short_detail if short_detail in _NOTABLE_STATUSES else None
+                    if current_round is not None and start_hole is not None:
+                        start_hole_by_athlete[aid] = (current_round, start_hole)
                 except Exception as exc:
                     log.warning("Status fetch failed: %s", exc)
 
@@ -460,6 +522,31 @@ def _fetch_tournament_data(
         })
 
         rounds = rounds_by_athlete.get(athlete_id, []) if fetch_round_data else []
+
+        # Apply started_on_back from the /status endpoint for the current round.
+        # The /linescores endpoint only includes hole data once a round has begun,
+        # so for not-yet-started rounds (linescores=[]) we fall back to startHole
+        # from /status which ESPN provides as soon as pairings are released.
+        if athlete_id in start_hole_by_athlete:
+            status_round, start_hole = start_hole_by_athlete[athlete_id]
+            for rd in rounds:
+                if rd["round_number"] == status_round and rd.get("started_on_back") is None:
+                    rd["started_on_back"] = start_hole >= 10
+
+        # Fix thru for back-nine starters on the front nine.
+        # When ESPN resets linescores to only the current 9 (front-nine) holes,
+        # thru reads 1–9 instead of 10–17.  If started_on_back is True but no
+        # back-nine hole (period >= 10) appeared in linescores, the golfer has
+        # crossed to the front nine and thru must be offset by +9.
+        for rd in rounds:
+            _has_back_nine = rd.pop("_has_back_nine_linescore", True)
+            if (
+                rd.get("started_on_back")
+                and rd.get("thru") is not None
+                and 0 < rd["thru"] < 10
+                and not _has_back_nine
+            ):
+                rd["thru"] += 9
 
         # Derive tee_time for tournament_entries.tee_time from Round 1 only.
         # Once Thursday starts, the pick is locked for the whole tournament —
@@ -610,6 +697,7 @@ def _fetch_team_field(
         )
 
         _NOTABLE_STATUSES_TEAM = {"WD", "CUT", "MDF", "DQ"}
+        start_hole_by_athlete_team: dict[str, tuple[int, int]] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
             futures_st = {
                 pool.submit(_fetch_competitor_status, pga_tour_id, competition_id, aid): aid
@@ -617,8 +705,10 @@ def _fetch_team_field(
             }
             for future in concurrent.futures.as_completed(futures_st):
                 try:
-                    aid, short_detail = future.result()
+                    aid, short_detail, current_round, start_hole = future.result()
                     status_by_athlete_team[aid] = short_detail if short_detail in _NOTABLE_STATUSES_TEAM else None
+                    if current_round is not None and start_hole is not None:
+                        start_hole_by_athlete_team[aid] = (current_round, start_hole)
                 except Exception as exc:
                     log.warning("Status fetch failed: %s", exc)
 
@@ -638,6 +728,24 @@ def _fetch_team_field(
         })
 
         rounds = rounds_by_athlete.get(athlete_id, []) if fetch_round_data else []
+
+        # Apply started_on_back from the /status endpoint (same logic as individual).
+        if athlete_id in start_hole_by_athlete_team:
+            status_round, start_hole = start_hole_by_athlete_team[athlete_id]
+            for rd in rounds:
+                if rd["round_number"] == status_round and rd.get("started_on_back") is None:
+                    rd["started_on_back"] = start_hole >= 10
+
+        # Fix thru for back-nine starters on the front nine (same logic as individual).
+        for rd in rounds:
+            _has_back_nine = rd.pop("_has_back_nine_linescore", True)
+            if (
+                rd.get("started_on_back")
+                and rd.get("thru") is not None
+                and 0 < rd["thru"] < 10
+                and not _has_back_nine
+            ):
+                rd["thru"] += 9
 
         # Derive tee_time for tournament_entries.tee_time from Round 1 only.
         # Once Thursday starts, the pick is locked for the whole tournament —
@@ -691,7 +799,7 @@ def _fetch_golfer_earnings(
         f"/competitions/{effective_competition_id}/competitors/{competitor_id}/statistics"
     )
     try:
-        with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        with httpx.Client(timeout=_REQUEST_TIMEOUT, headers=_ESPN_HEADERS) as client:
             resp = client.get(stats_url)
             if resp.status_code != 200:
                 return None
@@ -827,9 +935,15 @@ def parse_schedule_response(data: dict) -> list[dict]:
 # Database upsert helpers
 # ---------------------------------------------------------------------------
 
-def upsert_tournaments(db: Session, parsed: list[dict]) -> tuple[int, int]:
+def upsert_tournaments(
+    db: Session, parsed: list[dict]
+) -> tuple[int, int, list[tuple[str, str, str]]]:
     """
-    Upsert Tournament rows. Returns (created, updated).
+    Upsert Tournament rows. Returns (created, updated, transitions).
+
+    transitions is a list of (tournament_id_str, old_status, new_status) for
+    every row whose status changed in this call. The caller (sync_schedule) uses
+    this to publish SQS events for meaningful status changes.
 
     Only mutable fields (name, end_date, status) are updated on an existing
     row. multiplier is NOT overwritten because platform admins set it manually
@@ -840,18 +954,26 @@ def upsert_tournaments(db: Session, parsed: list[dict]) -> tuple[int, int]:
     manually corrected values).
     """
     created, updated = 0, 0
+    transitions: list[tuple[str, str, str]] = []
+
     for item in parsed:
         existing = db.query(Tournament).filter_by(pga_tour_id=item["pga_tour_id"]).first()
         if existing:
+            old_status = existing.status
+            new_status = item["status"]
             existing.name = item["name"]
             existing.start_date = item["start_date"]
             existing.end_date = item["end_date"]
-            existing.status = item["status"]
+            existing.status = new_status
             # Only update team-event fields if not yet set (preserves manual corrections).
             if existing.competition_id is None:
                 existing.competition_id = item.get("competition_id")
                 existing.is_team_event = item.get("is_team_event", False)
             updated += 1
+            if old_status != new_status:
+                # db.flush so existing.id is available; commit happens below.
+                db.flush()
+                transitions.append((str(existing.id), old_status, new_status))
         else:
             db.add(Tournament(
                 pga_tour_id=item["pga_tour_id"],
@@ -865,7 +987,7 @@ def upsert_tournaments(db: Session, parsed: list[dict]) -> tuple[int, int]:
             ))
             created += 1
     db.commit()
-    return created, updated
+    return created, updated, transitions
 
 
 def upsert_field(
@@ -963,8 +1085,7 @@ def upsert_field(
                         round_row.position = rd["position"]
                     round_row.is_playoff = rd.get("is_playoff", False)
                     # Always overwrite thru/started_on_back — they change every sync.
-                    if rd.get("thru") is not None:
-                        round_row.thru = rd["thru"]
+                    round_row.thru = rd.get("thru")
                     if rd.get("started_on_back") is not None:
                         round_row.started_on_back = rd["started_on_back"]
                 else:
@@ -1243,6 +1364,13 @@ def sync_schedule(db: Session, year: int) -> dict:
     """
     Fetch the PGA Tour schedule for a calendar year and upsert tournaments.
     Returns a summary dict with counts.
+
+    Publishes a TOURNAMENT_COMPLETED SQS event for every tournament that
+    transitions to "completed" in this sync. This triggers the finalization
+    pipeline (score_picks → score_round → advance_bracket) in the worker
+    container. SQS is only available when SQS_QUEUE_URL is set in the
+    environment — if it is absent (e.g. admin-triggered sync before the
+    worker is deployed) the publish step is silently skipped.
     """
     log.info("Syncing schedule for year %d", year)
     try:
@@ -1252,13 +1380,86 @@ def sync_schedule(db: Session, year: int) -> dict:
         raise
 
     parsed = parse_schedule_response(data)
-    created, updated = upsert_tournaments(db, parsed)
+    created, updated, transitions = upsert_tournaments(db, parsed)
 
     # Remove any rows that somehow slipped in past the Tour Championship cutoff.
     trimmed = _trim_post_championship_tournaments(db)
 
     log.info("Schedule sync: %d created, %d updated, %d trimmed", created, updated, trimmed)
+
+    # Publish SQS events for status transitions detected in this sync.
+    # We only publish TOURNAMENT_COMPLETED here; TOURNAMENT_IN_PROGRESS is
+    # published from sync_tournament() so it fires within 5 minutes of the
+    # first tee time rather than waiting for the next daily schedule sync.
+    _publish_schedule_transitions(transitions)
+
     return {"year": year, "tournaments_created": created, "tournaments_updated": updated, "tournaments_trimmed": trimmed}
+
+
+def _publish_schedule_transitions(transitions: list[tuple[str, str, str]]) -> None:
+    """
+    Publish SQS events for status transitions returned by upsert_tournaments().
+
+    Only fires when SQS_QUEUE_URL is present in the environment. Missing env
+    var is treated as a graceful no-op (early dev, local without LocalStack).
+    """
+    import os
+    if not os.environ.get("SQS_QUEUE_URL"):
+        return
+
+    from app.services.sqs import publish
+
+    for tournament_id, old_status, new_status in transitions:
+        if new_status == "completed":
+            log.info(
+                "Schedule sync: publishing TOURNAMENT_COMPLETED for %s (%s → %s)",
+                tournament_id, old_status, new_status,
+            )
+            try:
+                publish("TOURNAMENT_COMPLETED", tournament_id=tournament_id)
+            except Exception as exc:
+                # SQS failure must not abort the sync — log and continue.
+                log.error(
+                    "Failed to publish TOURNAMENT_COMPLETED for %s: %s",
+                    tournament_id, exc, exc_info=True,
+                )
+
+
+def _maybe_publish_in_progress(db: Session, tournament) -> None:
+    """
+    Publish TOURNAMENT_IN_PROGRESS if this tournament has at least one playoff
+    round in "drafting" status with draft_resolved_at IS NULL.
+
+    Called from sync_tournament() every ~5 minutes while live_score_sync is
+    active. The publish stops once all linked playoff rounds are resolved, so
+    the queue stays clean. SQS env vars must be present; if absent (no LocalStack
+    locally or worker not yet deployed) this is a silent no-op.
+    """
+    import os
+    if not os.environ.get("SQS_QUEUE_URL"):
+        return
+
+    from app.models import PlayoffRound
+    unresolved = (
+        db.query(PlayoffRound.id)
+        .filter(
+            PlayoffRound.tournament_id == tournament.id,
+            PlayoffRound.status == "drafting",
+            PlayoffRound.draft_resolved_at.is_(None),
+        )
+        .first()
+    )
+    if not unresolved:
+        return  # Nothing to resolve — skip publish
+
+    from app.services.sqs import publish
+    try:
+        publish("TOURNAMENT_IN_PROGRESS", tournament_id=str(tournament.id))
+    except Exception as exc:
+        log.error(
+            "Failed to publish TOURNAMENT_IN_PROGRESS for %s: %s",
+            tournament.id, exc, exc_info=True,
+        )
 
 
 def sync_tournament(db: Session, pga_tour_id: str, *, force: bool = False) -> dict:
@@ -1348,6 +1549,21 @@ def sync_tournament(db: Session, pga_tour_id: str, *, force: bool = False) -> di
     picks_scored = 0
     if tournament.status == TournamentStatus.COMPLETED.value:
         picks_scored = score_picks(db, tournament)
+
+    # Stamp the tournament with the current time as a sync-completion marker.
+    # This is the LAST write — after all upserts and pick scoring — so the frontend
+    # can poll this value and only refresh the leaderboard when a full sync is done.
+    tournament.last_synced_at = datetime.now(tz=timezone.utc)
+    db.commit()
+
+    # If the tournament is in_progress and has unresolved playoff draft rounds,
+    # publish TOURNAMENT_IN_PROGRESS so the worker can call resolve_draft() once
+    # the first Round 1 tee time passes. This runs every 5 minutes via
+    # live_score_sync, but stops publishing once all draft rounds are resolved
+    # (the guard below returns early). The worker handler is idempotent —
+    # receiving the same message multiple times is safe.
+    if tournament.status == TournamentStatus.IN_PROGRESS.value:
+        _maybe_publish_in_progress(db, tournament)
 
     log.info(
         "Tournament sync '%s': %d golfers, %d new entries, %d picks scored",

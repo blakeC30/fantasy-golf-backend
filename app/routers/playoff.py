@@ -7,7 +7,8 @@ Endpoints:
   PATCH  /leagues/{league_id}/playoff/config                         Update playoff config (manager)
   GET    /leagues/{league_id}/playoff/bracket                        Full bracket view
   PATCH  /leagues/{league_id}/playoff/rounds/{round_id}              Assign tournament & draft window (manager)
-  POST   /leagues/{league_id}/playoff/rounds/{round_id}/open         Open draft — auto-seeds round 1 (manager)
+  POST   /leagues/{league_id}/playoff/seed                           Trigger bracket seeding on demand (manager)
+  POST   /leagues/{league_id}/playoff/rounds/{round_id}/open         Open draft window for a round (manager)
   POST   /leagues/{league_id}/playoff/rounds/{round_id}/resolve      Resolve draft → picks (manager)
   POST   /leagues/{league_id}/playoff/rounds/{round_id}/score        Score completed round (manager)
   POST   /leagues/{league_id}/playoff/rounds/{round_id}/advance      Advance bracket (manager)
@@ -22,10 +23,11 @@ Endpoints:
 import math
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
+from app.limiter import limiter
 from app.dependencies import (
     get_active_season,
     get_current_user,
@@ -37,6 +39,7 @@ from app.models import (
     League,
     LeagueMember,
     LeagueTournament,
+    Pick,
     PlayoffConfig,
     PlayoffDraftPreference,
     PlayoffPick,
@@ -45,6 +48,7 @@ from app.models import (
     PlayoffRound,
     Season,
     Tournament,
+    TournamentEntry,
     User,
 )
 from app.models.tournament import TournamentStatus
@@ -77,6 +81,7 @@ from app.services.playoff import (
     override_result,
     resolve_draft,
     score_round,
+    seed_playoff,
     submit_preferences,
 )
 
@@ -151,7 +156,13 @@ def _build_pick_out(pick: PlayoffPick) -> PlayoffPickOut:
     )
 
 
-def _build_pod_out(pod: PlayoffPod, config: PlayoffConfig, round_number: int, is_picks_visible: bool = True) -> PlayoffPodOut:
+def _build_pod_out(
+    pod: PlayoffPod,
+    config: PlayoffConfig,
+    round_number: int,
+    is_picks_visible: bool = True,
+    viewer_user_id: uuid.UUID | None = None,
+) -> PlayoffPodOut:
     idx = round_number - 1
     picks_per_player = config.picks_per_round[idx] if idx < len(config.picks_per_round) else config.picks_per_round[-1]
     total_slots = len(pod.members) * picks_per_player
@@ -163,18 +174,33 @@ def _build_pod_out(pod: PlayoffPod, config: PlayoffConfig, round_number: int, is
                 active_slot = slot
                 break
 
+    all_picks = sorted(pod.picks, key=lambda p: p.draft_slot)
+    if is_picks_visible:
+        visible_picks = all_picks
+    else:
+        # Own picks are always visible; hide every other member's picks until
+        # the first Round 1 tee time passes (the playoff visibility threshold).
+        viewer_member = next((m for m in pod.members if m.user_id == viewer_user_id), None) if viewer_user_id else None
+        viewer_pod_member_id = viewer_member.id if viewer_member else None
+        visible_picks = [p for p in all_picks if p.pod_member_id == viewer_pod_member_id] if viewer_pod_member_id else []
+
     return PlayoffPodOut(
         id=pod.id,
         bracket_position=pod.bracket_position,
         status=pod.status,
         winner_user_id=pod.winner_user_id,
         members=[_build_pod_member_out(m) for m in sorted(pod.members, key=lambda m: m.seed)],
-        picks=[_build_pick_out(p) for p in sorted(pod.picks, key=lambda p: p.draft_slot)] if is_picks_visible else [],
+        picks=[_build_pick_out(p) for p in visible_picks],
         active_draft_slot=active_slot,
     )
 
 
-def _build_bracket_round_out(round_obj: PlayoffRound, config: PlayoffConfig, is_picks_visible: bool = True) -> BracketRoundOut:
+def _build_bracket_round_out(
+    round_obj: PlayoffRound,
+    config: PlayoffConfig,
+    is_picks_visible: bool = True,
+    viewer_user_id: uuid.UUID | None = None,
+) -> BracketRoundOut:
     tournament_name: str | None = None
     if round_obj.tournament:
         tournament_name = round_obj.tournament.name
@@ -186,7 +212,10 @@ def _build_bracket_round_out(round_obj: PlayoffRound, config: PlayoffConfig, is_
         tournament_name=tournament_name,
         draft_opens_at=round_obj.draft_opens_at,
         draft_resolved_at=round_obj.draft_resolved_at,
-        pods=[_build_pod_out(pod, config, round_obj.round_number, is_picks_visible=is_picks_visible) for pod in sorted(round_obj.pods, key=lambda p: p.bracket_position)],
+        pods=[
+            _build_pod_out(pod, config, round_obj.round_number, is_picks_visible=is_picks_visible, viewer_user_id=viewer_user_id)
+            for pod in sorted(round_obj.pods, key=lambda p: p.bracket_position)
+        ],
     )
 
 
@@ -326,42 +355,168 @@ def update_playoff_config(
 def get_bracket(
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
     season: Season = Depends(get_active_season),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Full bracket view — all rounds, pods, members, and picks (members only).
+
+    When the config is pending (not yet seeded), auto-seeds the bracket if the
+    regular-season schedule has locked. The schedule is locked when exactly
+    num_rounds_needed scheduled league tournaments remain — meaning all regular-
+    season tournaments have completed and only the playoff slots are left.
+    If conditions are not met yet, returns empty rounds so the frontend shows
+    the projected bracket computed from current standings.
+
+    Pick visibility: other members' resolved picks are hidden until the first
+    Round 1 tee time passes. A member's own picks are always visible.
     """
     league, _ = league_and_member
     config = _get_config_or_404(league.id, season.id, db)
 
-    # Eager-load everything in one query
-    config_loaded = (
-        db.query(PlayoffConfig)
-        .options(
-            joinedload(PlayoffConfig.rounds)
-            .joinedload(PlayoffRound.pods)
-            .joinedload(PlayoffPod.members)
-            .joinedload(PlayoffPodMember.user),
-            joinedload(PlayoffConfig.rounds)
-            .joinedload(PlayoffRound.pods)
-            .joinedload(PlayoffPod.picks)
-            .joinedload(PlayoffPick.golfer),
-            joinedload(PlayoffConfig.rounds)
-            .joinedload(PlayoffRound.tournament),
+    def _load_config():
+        return (
+            db.query(PlayoffConfig)
+            .options(
+                joinedload(PlayoffConfig.rounds)
+                .joinedload(PlayoffRound.pods)
+                .joinedload(PlayoffPod.members)
+                .joinedload(PlayoffPodMember.user),
+                joinedload(PlayoffConfig.rounds)
+                .joinedload(PlayoffRound.pods)
+                .joinedload(PlayoffPod.picks)
+                .joinedload(PlayoffPick.golfer),
+                joinedload(PlayoffConfig.rounds)
+                .joinedload(PlayoffRound.tournament),
+            )
+            .filter(PlayoffConfig.id == config.id)
+            .first()
         )
-        .filter(PlayoffConfig.id == config.id)
-        .first()
-    )
+
+    config_loaded = _load_config()
+
+    # Auto-seed when pending: check whether the schedule has locked.
+    # Conditions (all must be true):
+    #   1. Exactly num_rounds_needed SCHEDULED tournaments remain (all regular-season
+    #      ones have completed — those are the playoff-round tournaments).
+    #   2. No tournament in the league schedule is IN_PROGRESS.  Seeding while
+    #      the last regular-season tournament is still live would produce incorrect
+    #      standings (that tournament is excluded from calculate_standings until
+    #      it reaches COMPLETED status).
+    #   3. The most recently completed tournament's picks all have non-null
+    #      earnings_usd.  score_picks() leaves earnings_usd null when ESPN hasn't
+    #      published prize money yet; seeding on those standings would rank members
+    #      as if the last tournament's pickers all earned $0.
+    if config_loaded.status == "pending":
+        num_rounds_needed = _required_rounds(config_loaded.playoff_size)
+        scheduled_count = (
+            db.query(LeagueTournament)
+            .filter_by(league_id=league.id)
+            .join(Tournament, LeagueTournament.tournament_id == Tournament.id)
+            .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+            .count()
+        )
+        if scheduled_count == num_rounds_needed:
+            # Condition 2: no tournament is IN_PROGRESS
+            in_progress_count = (
+                db.query(LeagueTournament)
+                .filter_by(league_id=league.id)
+                .join(Tournament, LeagueTournament.tournament_id == Tournament.id)
+                .filter(Tournament.status == TournamentStatus.IN_PROGRESS.value)
+                .count()
+            )
+            # Condition 3: last completed tournament's pick earnings are published
+            earnings_ready = True
+            if in_progress_count == 0:
+                last_reg = (
+                    db.query(LeagueTournament)
+                    .filter_by(league_id=league.id)
+                    .join(Tournament, LeagueTournament.tournament_id == Tournament.id)
+                    .filter(Tournament.status == TournamentStatus.COMPLETED.value)
+                    .order_by(Tournament.start_date.desc())
+                    .first()
+                )
+                if last_reg:
+                    pick_golfer_ids_sq = (
+                        db.query(Pick.golfer_id)
+                        .filter(
+                            Pick.league_id == league.id,
+                            Pick.tournament_id == last_reg.tournament_id,
+                        )
+                    )
+                    unfinalized = (
+                        db.query(TournamentEntry)
+                        .filter(
+                            TournamentEntry.tournament_id == last_reg.tournament_id,
+                            TournamentEntry.golfer_id.in_(pick_golfer_ids_sq),
+                            TournamentEntry.earnings_usd.is_(None),
+                        )
+                        .first()
+                    )
+                    earnings_ready = unfinalized is None
+
+            if in_progress_count == 0 and earnings_ready:
+                try:
+                    seed_playoff(db, config_loaded)
+                    config_loaded = _load_config()
+                except HTTPException:
+                    pass  # Conditions not met; return projected (empty) bracket
 
     rounds_out = []
     for r in sorted(config_loaded.rounds, key=lambda r: r.round_number):
+        # Hide resolved picks while the tournament is live and not all R1 tee
+        # times have passed — mirrors the regular-season pick visibility rule.
         is_picks_visible = True
-        # Playoff rule: picks are hidden until the FIRST R1 tee time passes.
-        # (Regular season hides until the LAST tee time — different rule.)
-        if r.status == "locked" and r.tournament and r.tournament.status == "in_progress":
+        if r.status == "locked" and r.tournament and r.tournament.status != "completed":
             is_picks_visible = any_r1_teed_off(db, r.tournament_id)
-        rounds_out.append(_build_bracket_round_out(r, config_loaded, is_picks_visible=is_picks_visible))
+        rounds_out.append(_build_bracket_round_out(r, config_loaded, is_picks_visible=is_picks_visible, viewer_user_id=current_user.id))
 
+    return BracketOut(playoff_config=config_loaded, rounds=rounds_out)
+
+
+@router.post("/{league_id}/playoff/seed", status_code=200, response_model=BracketOut)
+def seed_bracket(
+    league_id: uuid.UUID,
+    season: Season = Depends(get_active_season),
+    league_and_member: tuple[League, LeagueMember] = Depends(require_league_manager),
+    db: Session = Depends(get_db),
+):
+    """
+    Manager: explicitly trigger bracket seeding.
+
+    Seeding also runs automatically the first time GET /bracket is called once
+    all regular-season conditions are met. This endpoint lets the manager force
+    it on demand — useful if no member has hit the bracket page yet and the
+    first playoff tournament is about to start.
+
+    Raises 422 if the bracket is already seeded or seeding conditions are not met.
+    """
+    league, _ = league_and_member
+    config = (
+        db.query(PlayoffConfig)
+        .filter_by(league_id=league.id, season_id=season.id)
+        .first()
+    )
+    if not config:
+        raise HTTPException(status_code=404, detail="No playoff configuration found for this league")
+
+    seed_playoff(db, config)
+
+    # Return the freshly seeded bracket so the manager can see the result.
+    config_loaded = (
+        db.query(PlayoffConfig)
+        .options(
+            joinedload(PlayoffConfig.rounds).joinedload(PlayoffRound.pods).joinedload(PlayoffPod.members).joinedload(PlayoffPodMember.user),
+            joinedload(PlayoffConfig.rounds).joinedload(PlayoffRound.pods).joinedload(PlayoffPod.picks).joinedload(PlayoffPick.golfer),
+            joinedload(PlayoffConfig.rounds).joinedload(PlayoffRound.tournament),
+        )
+        .filter_by(id=config.id)
+        .first()
+    )
+    rounds_out = [
+        _build_bracket_round_out(r, config_loaded)
+        for r in sorted(config_loaded.rounds, key=lambda r: r.round_number)
+    ]
     return BracketOut(playoff_config=config_loaded, rounds=rounds_out)
 
 
@@ -482,6 +637,7 @@ def advance_playoff_bracket(
 def get_pod_detail(
     pod_id: int,
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Full pod detail — members, picks, and active draft slot (members only)."""
@@ -492,14 +648,25 @@ def get_pod_detail(
     if pod.playoff_round.playoff_config.league_id != league.id:
         raise HTTPException(status_code=403, detail="Pod does not belong to this league")
 
-    config = pod.playoff_round.playoff_config
-    return _build_pod_out(pod, config, pod.playoff_round.round_number)
+    playoff_round = pod.playoff_round
+    tournament = playoff_round.tournament
+
+    # Hide resolved picks until the first Round 1 tee time has passed. Using
+    # != "completed" (rather than == "in_progress") also covers the edge case
+    # where the round was locked while the tournament was still "scheduled".
+    is_picks_visible = True
+    if playoff_round.status == "locked" and tournament and tournament.status != "completed":
+        is_picks_visible = any_r1_teed_off(db, tournament.id)
+
+    config = playoff_round.playoff_config
+    return _build_pod_out(pod, config, playoff_round.round_number, is_picks_visible=is_picks_visible, viewer_user_id=current_user.id)
 
 
 @router.get("/{league_id}/playoff/pods/{pod_id}/draft", response_model=PlayoffDraftStatusOut)
 def get_draft_status(
     pod_id: int,
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -540,22 +707,24 @@ def get_draft_status(
 
     picks_out = [_build_pick_out(p) for p in sorted(pod.picks, key=lambda p: p.draft_slot)]
 
-    # Hide resolved picks until the first Round 1 tee time has passed.
-    # Playoff rule: once any golfer tees off, all pod picks become visible.
-    if playoff_round.status == "locked" and tournament and tournament.status == "in_progress":
+    # Hide resolved picks until the first Round 1 tee time has passed. Using
+    # != "completed" (rather than == "in_progress") also covers the edge case
+    # where the round was locked while the tournament was still "scheduled".
+    # Own picks are always visible — only other members' picks are hidden.
+    if playoff_round.status == "locked" and tournament and tournament.status != "completed":
         if not any_r1_teed_off(db, tournament.id):
-            picks_out = []
+            viewer_member = next((m for m in pod.members if m.user_id == current_user.id), None)
+            viewer_pod_member_id = viewer_member.id if viewer_member else None
+            picks_out = [p for p in picks_out if p.pod_member_id == viewer_pod_member_id] if viewer_pod_member_id else []
 
     # Deadline = first R1 tee time (the moment preferences lock).
-    # Falls back to tournament.start_date midnight when tee times are not yet in the DB.
+    # When tee times are not yet in the DB, return None — the backend blocks
+    # submission via tournament.status instead. Do not fall back to start_date
+    # midnight UTC; that fires a day early for US-timezone users.
     from datetime import datetime, timezone
     deadline_dt: datetime | None = None
     if tournament:
         deadline_dt = first_r1_tee_time(db, tournament.id)
-        if deadline_dt is None and tournament.start_date:
-            deadline_dt = datetime.combine(
-                tournament.start_date, datetime.min.time()
-            ).replace(tzinfo=timezone.utc)
 
     return PlayoffDraftStatusOut(
         pod_id=pod.id,
@@ -604,7 +773,9 @@ def get_my_preferences(
 
 
 @router.put("/{league_id}/playoff/pods/{pod_id}/preferences", response_model=list[PlayoffPreferenceOut])
+@limiter.limit("30/hour")
 def submit_draft_preferences(
+    request: Request,
     pod_id: int,
     body: PlayoffPreferenceSubmit,
     league_and_member: tuple[League, LeagueMember] = Depends(require_league_member),
@@ -681,7 +852,7 @@ def get_my_playoff_pod(
     Used by Dashboard and MakePick to detect playoff weeks.
     Returns 200 in all cases (never 404 — absent config returns is_playoff_week=False).
     """
-    from datetime import datetime, time, timezone
+    from datetime import datetime, timezone
 
     _false = MyPlayoffPodOut(
         is_playoff_week=False,
@@ -777,12 +948,11 @@ def get_my_playoff_pod(
     )
     required_preference_count = pod_size * ppr
 
-    # Deadline = first R1 tee time; falls back to start_date midnight if not yet available.
+    # Deadline = first R1 tee time. When tee times are not yet in the DB,
+    # return None — the backend blocks submission via tournament.status instead.
+    # Do not fall back to start_date midnight UTC; that fires a day early for
+    # US-timezone users (Wednesday night UTC = Thursday calendar date).
     deadline_dt = first_r1_tee_time(db, nearest.id)
-    if deadline_dt is None and nearest.start_date:
-        deadline_dt = datetime.combine(
-            nearest.start_date, time.min
-        ).replace(tzinfo=timezone.utc)
 
     return MyPlayoffPodOut(
         is_playoff_week=True,
@@ -896,6 +1066,27 @@ def revise_playoff_pick(
 
     if pick.pod.playoff_round.playoff_config.league_id != league.id:
         raise HTTPException(status_code=403, detail="Pick does not belong to this league")
+
+    # Block revision once the bracket has been advanced (round completed).
+    if pick.pod.playoff_round.status == "completed":
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot revise a pick — this playoff round has already been advanced",
+        )
+
+    # Block individual pick revision once the tournament has completed.
+    # After tournament completion, use the pod winner override endpoint instead.
+    tournament_id = pick.pod.playoff_round.tournament_id
+    if tournament_id:
+        tournament_obj = db.query(Tournament).filter_by(id=tournament_id).first()
+        if tournament_obj and tournament_obj.status == "completed":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Cannot revise individual picks after the tournament has completed. "
+                    "Use the pod winner override endpoint (POST /playoff/override) instead."
+                ),
+            )
 
     golfer = db.query(Golfer).filter_by(id=body.golfer_id).first()
     if not golfer:

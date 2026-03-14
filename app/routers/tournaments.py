@@ -28,6 +28,7 @@ from app.schemas.tournament import (
     LeaderboardOut,
     RoundSummaryOut,
     ScorecardOut,
+    TournamentSyncStatusOut,
     TournamentOut,
 )
 
@@ -287,7 +288,31 @@ def get_leaderboard(
         tournament_name=tournament.name,
         tournament_status=tournament.status,
         is_team_event=tournament.is_team_event,
+        last_synced_at=tournament.last_synced_at,
         entries=result_entries,
+    )
+
+
+@router.get("/{tournament_id}/sync-status", response_model=TournamentSyncStatusOut)
+def get_sync_status(
+    tournament_id: uuid.UUID,
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Lightweight endpoint returning only the sync timestamp for a tournament.
+
+    Intended for polling: the frontend calls this every ~30 s while a tournament
+    is in_progress and, when last_synced_at changes, invalidates the full
+    leaderboard query.  Much cheaper than fetching the full leaderboard on each tick.
+    """
+    tournament = db.query(Tournament).filter_by(id=tournament_id).first()
+    if not tournament:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    return TournamentSyncStatusOut(
+        tournament_id=str(tournament_id),
+        tournament_status=tournament.status,
+        last_synced_at=tournament.last_synced_at,
     )
 
 

@@ -10,7 +10,6 @@ from app.schemas.user import UserOut
 
 class LeagueCreate(BaseModel):
     name: str
-    description: str | None = None
     # Default matches the house rule; league manager can override on creation.
     no_pick_penalty: int = -50_000
 
@@ -25,7 +24,6 @@ class LeagueCreate(BaseModel):
 class LeagueUpdate(BaseModel):
     """Partial update for league settings. Only provided fields are changed."""
     name: str | None = None
-    description: str | None = None
     no_pick_penalty: int | None = None
 
     @field_validator("no_pick_penalty")
@@ -39,7 +37,6 @@ class LeagueUpdate(BaseModel):
 class LeagueOut(BaseModel):
     id: uuid.UUID
     name: str
-    description: str | None
     no_pick_penalty: int
     invite_code: str
     is_public: bool
@@ -69,7 +66,6 @@ class LeagueJoinPreview(BaseModel):
     """League info shown to a user before they confirm a join request."""
     league_id: uuid.UUID
     name: str
-    description: str | None
     member_count: int
     # None = no relationship, "pending" = waiting for approval, "approved" = already a member
     user_status: str | None
@@ -79,5 +75,4 @@ class LeagueRequestOut(BaseModel):
     """A pending join request from the requesting user's perspective."""
     league_id: uuid.UUID
     league_name: str
-    league_description: str | None
     requested_at: datetime

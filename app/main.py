@@ -11,6 +11,14 @@ This file:
 import logging
 from contextlib import asynccontextmanager
 
+# Configure the root logger so that application-level log.info() calls are
+# visible in the container output alongside uvicorn's access log lines.
+# Uvicorn configures its own loggers separately; this only affects app code.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)-8s %(name)s: %(message)s",
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler

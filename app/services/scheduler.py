@@ -11,7 +11,8 @@ Jobs
   schedule_sync       (daily at 06:00 UTC)
     Fetches the full PGA Tour season schedule and upserts tournaments.
     Always runs — status transitions, rescheduling, and cancellations need
-    to be reflected promptly.
+    to be reflected promptly. Publishes TOURNAMENT_COMPLETED SQS events for
+    any tournament that transitions to "completed" in this sync.
 
   field_sync_d2       (daily at 14:00 UTC)
     Syncs the field for any tournament starting in exactly 2 days (fields
@@ -27,7 +28,7 @@ Jobs
     Syncs the field for any tournament starting today. This is the critical
     run — tee times are confirmed by now, and locked picks depend on them.
 
-  live_score_sync     (every 10 minutes, all days)
+  live_score_sync     (every 5 minutes, all days)
     Syncs live scores whenever a tournament is in_progress AND the current
     UTC time falls within the expected play window. The play window is
     derived from actual tee times stored in the DB (timezone-agnostic),
@@ -37,11 +38,27 @@ Jobs
     in_progress on Monday due to a weather delay or playoff carryover,
     live sync continues automatically.
 
+    Also publishes TOURNAMENT_IN_PROGRESS SQS events while any linked
+    playoff draft rounds remain unresolved (stops publishing once resolved).
+
   results_finalization  (daily at 09:00, 15:00, and 21:00 UTC)
     Finds any completed tournament with unscored picks and runs score_picks().
     Runs three times per day so it catches any finish time on any day of the
     week — a Monday afternoon finish is caught by the 21:00 UTC run; a
-    Tuesday finish is caught the next morning.
+    Tuesday finish is caught the next morning. Acts as a safety net if the
+    SQS TOURNAMENT_COMPLETED pipeline missed anything.
+
+Playoff automation (moved to SQS worker container)
+----------------------------------------------------
+  Playoff draft resolution and bracket advancement are handled by the SQS
+  worker container (app/worker_main.py), not by APScheduler jobs:
+
+    TOURNAMENT_IN_PROGRESS → resolve_draft() (when any R1 tee time passes)
+    TOURNAMENT_COMPLETED   → score_picks() → score_round() → advance_bracket()
+
+  This gives better timing (fires within seconds of the trigger event rather
+  than polling every 5–10 minutes) and eliminates race conditions when running
+  multiple scraper pods.
 
 Why BackgroundScheduler (not AsyncIOScheduler)?
 -----------------------------------------------
@@ -93,13 +110,18 @@ def _is_within_play_window(db, tournament) -> bool:
 
     Uses stored tee times from tournament_entry_rounds when available; falls
     back to a wide conservative window that covers all PGA Tour time zones.
+
+    Look-back window: PGA Tour rounds can finish after UTC midnight (late
+    afternoon ET = early morning UTC next day). We query the past 36 hours of
+    tee times so a round that started yesterday UTC but finished today is still
+    detected correctly. The play_end = max_tee_time + 5 hours naturally caps
+    the window so we don't sync indefinitely after a round ends.
     """
     # Lazy imports to avoid circular imports at module load time.
-    from sqlalchemy import func
     from app.models import TournamentEntry, TournamentEntryRound
 
     now_utc = datetime.now(tz=timezone.utc)
-    today_utc = now_utc.date()
+    lookback_start = now_utc - timedelta(hours=36)
 
     tee_time_rows = (
         db.query(TournamentEntryRound.tee_time)
@@ -107,7 +129,7 @@ def _is_within_play_window(db, tournament) -> bool:
         .filter(
             TournamentEntry.tournament_id == tournament.id,
             TournamentEntryRound.tee_time.isnot(None),
-            func.date(TournamentEntryRound.tee_time) == today_utc,
+            TournamentEntryRound.tee_time >= lookback_start,
         )
         .limit(500)  # cap the scan — we only need min/max
         .all()
@@ -122,7 +144,7 @@ def _is_within_play_window(db, tournament) -> bool:
                 for t in raw_times
             ]
             play_start = min(aware_times) - timedelta(minutes=30)
-            play_end = max(aware_times) + timedelta(hours=5)
+            play_end = max(aware_times) + timedelta(hours=8)
             in_window = play_start <= now_utc <= play_end
             log.debug(
                 "Play window from DB tee times: [%s – %s], now=%s, in_window=%s",
@@ -139,6 +161,7 @@ def _is_within_play_window(db, tournament) -> bool:
     #   - US East summer (UTC-4): first tee ~10:30 UTC, last finish ~00:00 UTC
     #   - Hawaii (UTC-10):        first tee ~16:30 UTC, last finish ~06:00 UTC
     # So [10:00 UTC, 07:00 UTC next day] covers the full range worldwide.
+    today_utc = now_utc.date()
     wide_start = datetime.combine(today_utc, dt_time(10, 0), tzinfo=timezone.utc)
     wide_end = datetime.combine(today_utc + timedelta(days=1), dt_time(7, 0), tzinfo=timezone.utc)
     in_window = wide_start <= now_utc <= wide_end
@@ -212,7 +235,7 @@ def _run_field_sync(days_before_start: int) -> None:
 
 def _run_live_score_sync() -> None:
     """
-    Every 10 minutes: sync live scores for any in_progress tournament,
+    Every 5 minutes: sync live scores for any in_progress tournament,
     but only if the current time falls within the computed play window.
 
     No day-of-week restriction — if a tournament is in_progress on Monday
@@ -388,7 +411,7 @@ def start_scheduler() -> None:
     # No day-of-week restriction — handles Monday/Tuesday weather carryovers.
     _scheduler.add_job(
         _run_live_score_sync,
-        CronTrigger(minute="*/10"),
+        CronTrigger(minute="*/5"),
         id="live_score_sync",
         replace_existing=True,
         misfire_grace_time=300,  # 5-minute grace (shorter — freshness matters)
@@ -405,6 +428,11 @@ def start_scheduler() -> None:
         replace_existing=True,
         misfire_grace_time=3600,
     )
+
+    # NOTE: Playoff draft resolution and bracket advancement are handled by the
+    # SQS worker container (app/worker_main.py). The TOURNAMENT_IN_PROGRESS
+    # and TOURNAMENT_COMPLETED events are published by sync_tournament() and
+    # sync_schedule() respectively, and consumed by the worker process.
 
     _scheduler.start()
     log.info("Scraper scheduler started. Jobs: %s", [j.id for j in _scheduler.get_jobs()])

@@ -12,6 +12,7 @@ from app.models.golfer import Golfer
 from app.models.tournament import Tournament, TournamentEntry, TournamentEntryRound, TournamentStatus
 from app.models.pick import Pick
 from app.models.league_tournament import LeagueTournament
+from app.models.password_reset_token import PasswordResetToken
 from app.models.playoff import PlayoffConfig, PlayoffRound, PlayoffPod, PlayoffPodMember, PlayoffPick, PlayoffDraftPreference
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "PlayoffPodMember",
     "PlayoffPick",
     "PlayoffDraftPreference",
+    "PasswordResetToken",
 ]

@@ -5,12 +5,12 @@ These define exactly what the API accepts and returns for authentication
 endpoints. Keeping them thin — validation lives in the service layer.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 
 
 class RegisterRequest(BaseModel):
     email: str
-    password: str
+    password: str = Field(min_length=8)
     display_name: str
 
 
@@ -22,6 +22,15 @@ class LoginRequest(BaseModel):
 class GoogleAuthRequest(BaseModel):
     """The Google ID token received by the frontend after the user signs in."""
     id_token: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8)
 
 
 class TokenResponse(BaseModel):

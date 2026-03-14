@@ -51,10 +51,15 @@ class LeagueTournamentOut(TournamentOut):
     tournament has passed. The frontend uses this to hide the pick button when
     a member has no pick and the late-entry window has closed. Defaults to
     False (safe default — never hide the button unless we know all teed off).
+
+    is_playoff_round is True when this tournament is assigned to a PlayoffRound
+    for this league. Lets the frontend distinguish playoff weeks from regular
+    weeks without a separate bracket API call. Defaults to False.
     """
 
     effective_multiplier: float
     all_r1_teed_off: bool = False
+    is_playoff_round: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +102,14 @@ class LeaderboardOut(BaseModel):
     tournament_name: str
     tournament_status: str
     is_team_event: bool
+    last_synced_at: datetime | None = None
     entries: list[LeaderboardEntryOut]
+
+
+class TournamentSyncStatusOut(BaseModel):
+    tournament_id: str
+    tournament_status: str
+    last_synced_at: datetime | None
 
 
 # ---------------------------------------------------------------------------

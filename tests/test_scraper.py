@@ -231,9 +231,10 @@ class TestUpsertTournaments:
                 "multiplier": 1.0,
             }
         ]
-        created, updated = upsert_tournaments(db, parsed)
+        created, updated, transitions = upsert_tournaments(db, parsed)
         assert created == 1
         assert updated == 0
+        assert transitions == []
 
         from app.models import Tournament
         t = db.query(Tournament).filter_by(pga_tour_id="ESPN_001").first()
@@ -262,9 +263,12 @@ class TestUpsertTournaments:
                 "multiplier": 1.0,
             }
         ]
-        created, updated = upsert_tournaments(db, parsed)
+        created, updated, transitions = upsert_tournaments(db, parsed)
         assert created == 0
         assert updated == 1
+        assert len(transitions) == 1
+        assert transitions[0][1] == "scheduled"
+        assert transitions[0][2] == "completed"
 
         t = db.query(Tournament).filter_by(pga_tour_id="ESPN_002").first()
         assert t.name == "New Name"
