@@ -45,7 +45,19 @@ async def lifespan(_app: FastAPI):
     affect API availability, and the two can be deployed independently.
     Manual sync triggers remain available via POST /admin/sync.
     """
-    log.info("Starting League Caddie API")
+    log.info("Starting League Caddie API (environment=%s)", settings.ENVIRONMENT)
+    if settings.ENVIRONMENT != "production":
+        log.warning(
+            "ENVIRONMENT is %r — refresh-token cookies will be sent without the "
+            "Secure flag. Set ENVIRONMENT=production in production deployments.",
+            settings.ENVIRONMENT,
+        )
+    else:
+        if not settings.FRONTEND_URL.startswith("https://"):
+            raise RuntimeError(
+                f"FRONTEND_URL must start with 'https://' in production, got {settings.FRONTEND_URL!r}. "
+                "Set the correct origin in your environment variables."
+            )
     yield
     log.info("Shutting down League Caddie API")
 

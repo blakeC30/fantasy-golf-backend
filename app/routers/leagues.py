@@ -19,8 +19,11 @@ Endpoints:
 """
 
 import datetime
+import logging
 import math
 import uuid
+
+log = logging.getLogger(__name__)
 
 LEAGUE_MEMBER_CAP = 500
 LEAGUE_PENDING_CAP = LEAGUE_MEMBER_CAP // 5  # 100
@@ -288,7 +291,11 @@ def delete_league(
                                                   ↳ playoff_draft_preferences
     Regular tables: picks → seasons → league_members → league_tournaments → league.
     """
-    league, _ = league_and_manager
+    league, manager = league_and_manager
+    log.warning(
+        "League deleted: league_id=%s name=%r by user_id=%s",
+        league.id, league.name, manager.user_id,
+    )
 
     # Build subquery chains for playoff tables (no direct league_id FK below playoff_configs).
     config_ids = db.query(PlayoffConfig.id).filter(PlayoffConfig.league_id == league.id).subquery()
@@ -475,6 +482,7 @@ def leave_league(
 ):
     """Allow any approved member to leave a league voluntarily."""
     league, membership = league_and_member
+    log.info("Member left: league_id=%s user_id=%s", league.id, membership.user_id)
     _remove_member_picks_and_playoff(db, league, membership.user_id)
     db.delete(membership)
     db.commit()
@@ -488,6 +496,10 @@ def remove_member(
 ):
     """Remove an approved member from a league. Requires league manager."""
     league, manager_membership = league_and_manager
+    log.info(
+        "Member removed: league_id=%s target_user_id=%s by manager_user_id=%s",
+        league.id, user_id, manager_membership.user_id,
+    )
 
     if user_id == manager_membership.user_id:
         raise HTTPException(status_code=400, detail="You cannot remove yourself from the league")

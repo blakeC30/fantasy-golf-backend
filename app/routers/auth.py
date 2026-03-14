@@ -14,6 +14,7 @@ Endpoints:
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from google.auth.exceptions import GoogleAuthError
 from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
@@ -124,9 +125,16 @@ def google_auth(request: Request, body: GoogleAuthRequest, response: Response, d
 
     try:
         claims = verify_google_id_token(body.id_token)
-    except Exception as exc:
+    except GoogleAuthError as exc:
+        # Token is invalid, expired, or issued for a different client — return 401.
         log.warning("Google token verification failed: %s", exc)
         raise HTTPException(status_code=401, detail="Invalid Google ID token")
+    except Exception:
+        # Unexpected error (misconfigured GOOGLE_CLIENT_ID, network failure, library
+        # bug). Re-raise so FastAPI returns 500 and the traceback appears in logs —
+        # swallowing it as a 401 would hide configuration problems silently.
+        log.exception("Unexpected error during Google token verification")
+        raise
 
     google_id = claims["sub"]
     email = claims.get("email", "").lower()

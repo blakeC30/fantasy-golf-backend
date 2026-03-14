@@ -46,7 +46,7 @@ def send_password_reset_email(to_email: str, raw_token: str) -> None:
 
     text_body = (
         "You requested a password reset for your League Caddie account.\n\n"
-        "Click the link below to set a new password (expires in 1 hour):\n\n"
+        f"Click the link below to set a new password (expires in {settings.RESET_TOKEN_EXPIRE_HOURS} hour(s)):\n\n"
         f"{reset_url}\n\n"
         "If you didn't request this, you can safely ignore this email.\n"
     )
@@ -91,7 +91,7 @@ def send_password_reset_email(to_email: str, raw_token: str) -> None:
               <h1 style="margin:0 0 16px;font-size:26px;font-weight:700;color:#111827;line-height:1.25;">Reset your password</h1>
               <p style="margin:0 0 28px;font-size:15px;color:#6b7280;line-height:1.6;">
                 We received a request to reset the password for your League Caddie account.
-                Click the button below to choose a new password. This link expires in <strong style="color:#111827;">1&nbsp;hour</strong>.
+                Click the button below to choose a new password. This link expires in <strong style="color:#111827;">{settings.RESET_TOKEN_EXPIRE_HOURS}&nbsp;hour(s)</strong>.
               </p>
 
               <!-- CTA button — matches bg-green-800 hover:bg-green-700 font-semibold py-3 px-6 rounded-xl -->

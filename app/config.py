@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # --- Auth ---
     # Long random string used to sign JWTs. Change this in production.
     SECRET_KEY: str = "change-this-to-a-long-random-secret-key"
+    # How long password-reset links are valid. Referenced by the auth service,
+    # email body, and frontend UI — change here and it propagates everywhere.
+    RESET_TOKEN_EXPIRE_HOURS: int = 1
 
     # --- Google OAuth ---
     # Client ID from the Google Cloud Console. Used to verify ID tokens.

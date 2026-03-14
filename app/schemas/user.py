@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UserOut(BaseModel):
@@ -26,4 +26,4 @@ class UserOut(BaseModel):
 
 class UserUpdate(BaseModel):
     """Fields the user is allowed to change about themselves."""
-    display_name: str | None = None
+    display_name: str | None = Field(default=None, min_length=1, max_length=100)

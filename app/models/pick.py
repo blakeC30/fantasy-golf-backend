@@ -113,7 +113,7 @@ class Pick(Base):
 
     @property
     def golfer_status(self) -> str | None:
-        """Golfer's status in the tournament (e.g. 'CUT', 'WD', 'DQ'); None if active/finished normally."""
+        """Golfer's status in the tournament (e.g. 'CUT', 'WD', 'MDF', 'DQ'); None if active/finished normally."""
         return self.entry.status if self.entry is not None else None
 
     @property

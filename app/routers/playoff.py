@@ -258,6 +258,25 @@ def _required_rounds(playoff_size: int) -> int:
     return int(math.log2(playoff_size))  # 2→1, 4→2, 8→3, 16→4
 
 
+def _approved_member_count(league_id: uuid.UUID, db: Session) -> int:
+    """Return the number of approved (active) members in the league."""
+    return (
+        db.query(LeagueMember)
+        .filter_by(league_id=league_id, status="approved")
+        .count()
+    )
+
+
+def _validate_playoff_size_vs_members(playoff_size: int, league_id: uuid.UUID, db: Session) -> None:
+    """Raise 422 if playoff_size exceeds the number of approved league members."""
+    member_count = _approved_member_count(league_id, db)
+    if playoff_size > member_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Playoff size ({playoff_size}) cannot exceed the number of approved members ({member_count})",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Config endpoints
 # ---------------------------------------------------------------------------
@@ -277,8 +296,9 @@ def create_playoff_config(
     if existing:
         raise HTTPException(status_code=409, detail="Playoff config already exists for this season")
 
-    # Validate that the current schedule has enough eligible future tournaments.
+    # Validate that playoff_size fits within the league's member count and schedule.
     if body.playoff_size > 0:
+        _validate_playoff_size_vs_members(body.playoff_size, league.id, db)
         required = _required_rounds(body.playoff_size)
         eligible = _count_eligible_playoff_tournaments(league.id, db)
         if eligible < required:
@@ -328,6 +348,7 @@ def update_playoff_config(
 
     if body.playoff_size is not None:
         if body.playoff_size > 0:
+            _validate_playoff_size_vs_members(body.playoff_size, league.id, db)
             required = _required_rounds(body.playoff_size)
             eligible = _count_eligible_playoff_tournaments(league.id, db)
             if eligible < required:

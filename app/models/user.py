@@ -6,16 +6,16 @@ A single user can belong to many leagues. Auth supports two methods:
   - Google OAuth:   google_id is set, password_hash may be None.
   - Both linked:    both fields are set (account linking).
 
-At least one of password_hash or google_id must be non-null.
-This constraint is enforced in the application layer (services/auth.py),
-not at the database level, to keep the schema simple.
+At least one of password_hash or google_id must be non-null. This invariant
+is enforced both in the application layer (services/auth.py) and at the
+database level via a CHECK constraint (ck_users_has_auth_method).
 """
 
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, String, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Index, String, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,6 +29,17 @@ if TYPE_CHECKING:
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        # Every account must have at least one auth method.
+        CheckConstraint(
+            "password_hash IS NOT NULL OR google_id IS NOT NULL",
+            name="ck_users_has_auth_method",
+        ),
+        # Enforce email uniqueness case-insensitively. All auth code normalises
+        # emails to lowercase before writing, but this index makes the guarantee
+        # DB-level so a future code path can't accidentally create duplicates.
+        Index("ix_users_email_lower", text("LOWER(email)"), unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -38,9 +49,9 @@ class User(Base):
     )
     email: Mapped[str] = mapped_column(
         String(255),
-        unique=True,
         nullable=False,
-        index=True,
+        # Uniqueness is enforced by the functional index ix_users_email_lower in
+        # __table_args__ (LOWER(email)), not a plain column-level unique constraint.
     )
     # Nullable: Google-only accounts have no password.
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)

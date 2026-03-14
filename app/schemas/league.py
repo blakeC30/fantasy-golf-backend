@@ -3,13 +3,13 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.user import UserOut
 
 
 class LeagueCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=60)
     # Default matches the house rule; league manager can override on creation.
     no_pick_penalty: int = -50_000
 
@@ -25,7 +25,7 @@ class LeagueCreate(BaseModel):
 
 class LeagueUpdate(BaseModel):
     """Partial update for league settings. Only provided fields are changed."""
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=60)
     no_pick_penalty: int | None = None
 
     @field_validator("no_pick_penalty")

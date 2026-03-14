@@ -234,6 +234,8 @@ Existing migration files (in order):
 16. `g3h5i7j9k1l2` — drop `leagues.description` column
 17. `h4i6j8k0l2m3` — add `tournaments.last_synced_at` (DateTime, nullable) — set by scraper after each full sync_tournament completes
 18. `i5j7k9l1m3n5` — add `password_reset_tokens` table (forgot-password flow)
+19. `j6k8l0m2n4o6` — add CHECK constraint `ck_users_has_auth_method` on `users` (password_hash IS NOT NULL OR google_id IS NOT NULL)
+20. `k7l9m1n3o5p7` — replace `ix_users_email` (case-sensitive btree) with `ix_users_email_lower` (UNIQUE on LOWER(email))
 
 New migrations still go in `alembic/versions/` with correct `down_revision` chaining, but are applied manually via psql.
 

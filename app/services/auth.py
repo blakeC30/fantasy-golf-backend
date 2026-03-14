@@ -75,9 +75,6 @@ def decode_refresh_token(token: str) -> dict:
     return payload
 
 
-RESET_TOKEN_EXPIRE_HOURS = 1
-
-
 def _hash_token(raw: str) -> str:
     """Return the SHA-256 hex digest of a raw token string."""
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -98,7 +95,7 @@ def generate_reset_token(db: Session, user) -> str:
         PasswordResetToken(
             user_id=user.id,
             token_hash=_hash_token(raw),
-            expires_at=datetime.now(tz=timezone.utc) + timedelta(hours=RESET_TOKEN_EXPIRE_HOURS),
+            expires_at=datetime.now(tz=timezone.utc) + timedelta(hours=settings.RESET_TOKEN_EXPIRE_HOURS),
         )
     )
     db.commit()
