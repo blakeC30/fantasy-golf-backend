@@ -136,6 +136,7 @@ class PlayoffPodOut(BaseModel):
     members: list[PlayoffPodMemberOut]
     picks: list[PlayoffPickOut]
     active_draft_slot: int | None  # None when draft is complete or not started
+    is_picks_visible: bool  # False = picks still hidden (any_r1_teed_off not yet reached)
 
     model_config = ConfigDict(from_attributes=True)
 

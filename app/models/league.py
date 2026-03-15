@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     # This avoids circular imports while keeping the type checker happy.
     from app.models.league_tournament import LeagueTournament
     from app.models.pick import Pick
+    from app.models.pick_reminder import PickReminder
     from app.models.season import Season
     from app.models.user import User
 
@@ -123,6 +124,9 @@ class League(Base):
     seasons: Mapped[list["Season"]] = relationship(back_populates="league")
     picks: Mapped[list["Pick"]] = relationship(back_populates="league")
     league_tournaments: Mapped[list["LeagueTournament"]] = relationship(back_populates="league")
+    pick_reminders: Mapped[list["PickReminder"]] = relationship(
+        back_populates="league", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<League id={self.id} name={self.name!r}>"

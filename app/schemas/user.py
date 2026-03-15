@@ -16,6 +16,7 @@ class UserOut(BaseModel):
     email: str
     display_name: str
     is_platform_admin: bool
+    pick_reminders_enabled: bool
     created_at: datetime
 
     # from_attributes=True tells Pydantic to read data from ORM object
@@ -27,3 +28,4 @@ class UserOut(BaseModel):
 class UserUpdate(BaseModel):
     """Fields the user is allowed to change about themselves."""
     display_name: str | None = Field(default=None, min_length=1, max_length=100)
+    pick_reminders_enabled: bool | None = None

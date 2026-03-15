@@ -73,6 +73,16 @@ class User(Base):
         server_default="false",
         nullable=False,
     )
+
+    # Opt-out flag for Wednesday pick reminder emails. Default True — all users
+    # receive reminders unless they explicitly turn them off in Settings.
+    pick_reminders_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+        nullable=False,
+    )
+
     # server_default=func.now() means the DB sets this automatically on INSERT.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

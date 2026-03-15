@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from app.models.golfer import Golfer
     from app.models.league_tournament import LeagueTournament
     from app.models.pick import Pick
+    from app.models.pick_reminder import PickReminder
 
 
 class TournamentStatus(str, enum.Enum):
@@ -137,6 +138,9 @@ class Tournament(Base):
     )
     picks: Mapped[list["Pick"]] = relationship(back_populates="tournament")
     league_tournaments: Mapped[list["LeagueTournament"]] = relationship(back_populates="tournament")
+    pick_reminders: Mapped[list["PickReminder"]] = relationship(
+        back_populates="tournament", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<Tournament name={self.name!r} status={self.status}>"

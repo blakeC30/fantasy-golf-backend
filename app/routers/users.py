@@ -32,6 +32,8 @@ def update_me(
 ):
     if body.display_name is not None:
         current_user.display_name = body.display_name
+    if body.pick_reminders_enabled is not None:
+        current_user.pick_reminders_enabled = body.pick_reminders_enabled
     db.commit()
     db.refresh(current_user)
     return current_user

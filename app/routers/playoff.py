@@ -192,6 +192,7 @@ def _build_pod_out(
         members=[_build_pod_member_out(m) for m in sorted(pod.members, key=lambda m: m.seed)],
         picks=[_build_pick_out(p) for p in visible_picks],
         active_draft_slot=active_slot,
+        is_picks_visible=is_picks_visible,
     )
 
 
@@ -228,16 +229,21 @@ def _count_eligible_playoff_tournaments(league_id: uuid.UUID, db: Session) -> in
     """
     Count scheduled (future) league tournaments that are eligible as playoff rounds.
 
-    Eligibility: tournament.status == 'scheduled' AND not the very next upcoming
-    tournament (which is reserved for the current week's regular-season pick).
+    Eligibility: tournament.status == 'scheduled' AND (when no tournament is currently
+    in progress) not the very next upcoming tournament.
+
+    When a tournament IS in progress, picks for the next tournament haven't opened yet,
+    so that tournament is still eligible as a playoff round. When no tournament is in
+    progress, picks for the next tournament are open (current pick week), so it is
+    excluded.
     """
-    next_upcoming = (
-        db.query(Tournament)
-        .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
-        .order_by(Tournament.start_date.asc())
-        .first()
-    )
-    next_upcoming_id = next_upcoming.id if next_upcoming else None
+    has_in_progress = db.query(
+        db.query(LeagueTournament)
+        .filter_by(league_id=league_id)
+        .join(LeagueTournament.tournament)
+        .filter(Tournament.status == TournamentStatus.IN_PROGRESS.value)
+        .exists()
+    ).scalar()
 
     query = (
         db.query(LeagueTournament)
@@ -245,8 +251,16 @@ def _count_eligible_playoff_tournaments(league_id: uuid.UUID, db: Session) -> in
         .join(LeagueTournament.tournament)
         .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
     )
-    if next_upcoming_id is not None:
-        query = query.filter(Tournament.id != next_upcoming_id)
+
+    if not has_in_progress:
+        next_upcoming = (
+            db.query(Tournament)
+            .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+            .order_by(Tournament.start_date.asc())
+            .first()
+        )
+        if next_upcoming:
+            query = query.filter(Tournament.id != next_upcoming.id)
 
     return query.count()
 

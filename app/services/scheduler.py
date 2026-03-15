@@ -41,6 +41,12 @@ Jobs
     Also publishes TOURNAMENT_IN_PROGRESS SQS events while any linked
     playoff draft rounds remain unresolved (stops publishing once resolved).
 
+  pick_reminder_send  (weekly Wednesday at 12:00 UTC)
+    Creates PickReminder rows for all scheduled tournaments starting within
+    the next 7 days, then immediately sends emails to approved league members
+    who haven't picked yet and have pick_reminders_enabled = True. Leagues
+    with no active season are silently skipped.
+
   results_finalization  (daily at 09:00, 15:00, and 21:00 UTC)
     Finds any completed tournament with unscored picks and runs score_picks().
     Runs three times per day so it catches any finish time on any day of the
@@ -287,6 +293,35 @@ def _run_live_score_sync() -> None:
         db.close()
 
 
+def _run_pick_reminder_send() -> None:
+    """
+    Weekly Wednesday at 12:00 UTC: send pick reminder emails.
+
+    Finds all scheduled PGA tournaments starting in the next 7 days,
+    creates PickReminder rows (idempotent), and immediately emails all
+    approved league members who haven't picked yet. Leagues without an
+    active season are silently skipped.
+    """
+    from app.database import SessionLocal
+    from app.services.pick_reminders import create_and_send_pick_reminders
+
+    db = SessionLocal()
+    try:
+        result = create_and_send_pick_reminders(db)
+        log.info(
+            "Pick reminders: sent=%d failed=%d skipped=%d",
+            result["sent"],
+            result["failed"],
+            result["skipped"],
+        )
+        if result["errors"]:
+            log.warning("Pick reminder errors: %s", result["errors"])
+    except Exception as exc:
+        log.error("Pick reminder send failed: %s", exc, exc_info=True)
+    finally:
+        db.close()
+
+
 def _run_results_finalization() -> None:
     """
     Daily at 09:00, 15:00, 21:00 UTC: score picks for any completed tournament
@@ -425,6 +460,19 @@ def start_scheduler() -> None:
         _run_results_finalization,
         CronTrigger(hour="9,15,21", minute=0),
         id="results_finalization",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # ── 5. Pick reminder emails ───────────────────────────────────────────
+    # Once per week — Wednesday at 12:00 UTC (noon). Covers all tournaments
+    # starting Thursday through the following Wednesday. Sending on Wednesday
+    # gives members ~12–24 hours to pick before Thursday tee times while
+    # limiting email volume to one per tournament per league per season.
+    _scheduler.add_job(
+        _run_pick_reminder_send,
+        CronTrigger(day_of_week="wed", hour=12, minute=0),
+        id="pick_reminder_send",
         replace_existing=True,
         misfire_grace_time=3600,
     )

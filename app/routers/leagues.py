@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 LEAGUE_MEMBER_CAP = 500
 LEAGUE_PENDING_CAP = LEAGUE_MEMBER_CAP // 5  # 100
+USER_LEAGUE_CAP = 5  # Max approved leagues a single user may belong to (created + joined combined)
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
@@ -79,6 +80,17 @@ def create_league(
     An active season for the current calendar year is created. All leagues are
     private by default — joining requires an invite link and manager approval.
     """
+    # Guard: per-user league cap — checked before any DB write so nothing is rolled back.
+    user_league_count = db.query(LeagueMember).filter_by(
+        user_id=current_user.id,
+        status=LeagueMemberStatus.APPROVED.value,
+    ).count()
+    if user_league_count >= USER_LEAGUE_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You have reached the maximum of {USER_LEAGUE_CAP} leagues. Leave a league before creating another.",
+        )
+
     league = League(
         name=body.name,
         no_pick_penalty=body.no_pick_penalty,
@@ -202,6 +214,18 @@ def request_to_join(
         if existing.status == LeagueMemberStatus.APPROVED.value:
             raise HTTPException(status_code=409, detail="You are already a member of this league")
         raise HTTPException(status_code=409, detail="You already have a pending join request for this league")
+
+    # Guard: per-user league cap — block the request now so the user isn't waiting for
+    # an approval that can never succeed.
+    user_league_count = db.query(LeagueMember).filter_by(
+        user_id=current_user.id,
+        status=LeagueMemberStatus.APPROVED.value,
+    ).count()
+    if user_league_count >= USER_LEAGUE_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You have reached the maximum of {USER_LEAGUE_CAP} leagues. Leave a league before joining another.",
+        )
 
     # Guard: too many pending requests already in the queue for this league.
     pending_count = db.query(LeagueMember).filter_by(
@@ -564,6 +588,19 @@ def approve_join_request(
             detail=f"This league has reached its maximum member limit of {LEAGUE_MEMBER_CAP}. Remove a member before approving new ones.",
         )
 
+    # Guard: per-user league cap — the requestor may have joined other leagues since
+    # this request was submitted. Prevents a race condition where a user submits multiple
+    # pending requests and gets approved into more than USER_LEAGUE_CAP leagues.
+    user_league_count = db.query(LeagueMember).filter_by(
+        user_id=user_id,
+        status=LeagueMemberStatus.APPROVED.value,
+    ).count()
+    if user_league_count >= USER_LEAGUE_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot approve: this member is already in {USER_LEAGUE_CAP} leagues (the maximum). They must leave a league first.",
+        )
+
     membership.status = LeagueMemberStatus.APPROVED.value
     db.commit()
     db.refresh(membership)
@@ -659,15 +696,27 @@ def _playoff_tournament_ids_for_league(league_id: uuid.UUID, db: Session) -> fro
         # Mirror _required_rounds() from playoff.py — log2 of bracket size.
         required = 4 if config.playoff_size == 32 else int(math.log2(config.playoff_size))
 
-        # Exclude the globally-next upcoming tournament (reserved for the
-        # current pick week), matching the frontend's savedPlayoffRoundMap logic.
-        next_upcoming = (
-            db.query(Tournament)
-            .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
-            .order_by(Tournament.start_date.asc())
-            .first()
-        )
-        next_upcoming_id = next_upcoming.id if next_upcoming else None
+        # Exclude the globally-next upcoming tournament (reserved for the current
+        # pick week) only when no league tournament is currently in progress.
+        # While in progress, the next tournament's pick window hasn't opened yet,
+        # so it remains eligible as a playoff round.
+        has_in_progress = db.query(
+            db.query(LeagueTournament)
+            .filter_by(league_id=league_id)
+            .join(LeagueTournament.tournament)
+            .filter(Tournament.status == TournamentStatus.IN_PROGRESS.value)
+            .exists()
+        ).scalar()
+
+        next_upcoming_id = None
+        if not has_in_progress:
+            next_upcoming = (
+                db.query(Tournament)
+                .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+                .order_by(Tournament.start_date.asc())
+                .first()
+            )
+            next_upcoming_id = next_upcoming.id if next_upcoming else None
 
         candidates_q = (
             db.query(LeagueTournament)
@@ -856,19 +905,30 @@ def update_league_tournaments(
         else:
             required = int(math.log2(playoff_config.playoff_size))
 
-        next_upcoming = (
-            db.query(Tournament)
-            .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
-            .order_by(Tournament.start_date.asc())
-            .first()
+        # Exclude the next upcoming tournament only when no league tournament is in
+        # progress. While in progress, picks for the next tournament haven't opened
+        # yet, so it remains eligible as a playoff round.
+        has_in_progress = any(
+            tournament_map[item.tournament_id].status == TournamentStatus.IN_PROGRESS.value
+            for item in body.tournaments
+            if tournament_map.get(item.tournament_id)
         )
-        next_upcoming_id = next_upcoming.id if next_upcoming else None
+
+        next_upcoming_id = None
+        if not has_in_progress:
+            next_upcoming = (
+                db.query(Tournament)
+                .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+                .order_by(Tournament.start_date.asc())
+                .first()
+            )
+            next_upcoming_id = next_upcoming.id if next_upcoming else None
 
         eligible = sum(
             1 for item in body.tournaments
             if tournament_map.get(item.tournament_id)
             and tournament_map[item.tournament_id].status == TournamentStatus.SCHEDULED.value
-            and tournament_map[item.tournament_id].id != next_upcoming_id
+            and (next_upcoming_id is None or tournament_map[item.tournament_id].id != next_upcoming_id)
         )
         if eligible < required:
             raise HTTPException(

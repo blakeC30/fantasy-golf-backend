@@ -8,6 +8,11 @@ Scoring rules:
   - If a user has no pick row for a completed tournament → league.no_pick_penalty is applied
   - Standings are sorted by total_points descending (highest wins)
 
+Tie-breaking (applied in order when total_points are equal):
+  1. Most picks submitted (higher pick_count wins — rewards consistent participation)
+  2. Highest single-tournament score (best_week — rewards peak performance)
+  3. Earliest league join date (joined_at ascending — stable, ungameable last resort)
+
 This module contains pure calculation logic with no HTTP concerns. It can be
 called from both the standings router and the scraper (when finalizing results).
 """
@@ -110,6 +115,8 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
         missed = completed_ids - picked_ids
         total += len(missed) * league.no_pick_penalty
 
+        best_week = max((p.points_earned for p in user_picks), default=0.0)  # type: ignore[misc]
+
         standings.append(
             {
                 "user_id": member.user_id,
@@ -117,8 +124,21 @@ def calculate_standings(db: Session, league: League, season: Season) -> list[dic
                 "total_points": total,
                 "pick_count": len(picked_ids),
                 "missed_count": len(missed),
+                "best_week": best_week,
+                "joined_at": member.joined_at,
             }
         )
 
-    standings.sort(key=lambda x: (-x["total_points"], x["display_name"]))
+    # Sort by total_points desc, then tie-break:
+    #   1. pick_count desc  — most picks submitted (consistent participation)
+    #   2. best_week desc   — highest single-tournament score (peak performance)
+    #   3. joined_at asc    — earliest join date (stable, ungameable last resort)
+    standings.sort(
+        key=lambda x: (
+            -x["total_points"],
+            -x["pick_count"],
+            -x["best_week"],
+            x["joined_at"],
+        )
+    )
     return standings

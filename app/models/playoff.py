@@ -42,7 +42,7 @@ class PlayoffConfig(Base):
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     playoff_size: Mapped[int] = mapped_column(Integer, nullable=False, default=16, server_default="16")
     draft_style: Mapped[str] = mapped_column(String(30), nullable=False, default="snake", server_default="snake")
-    picks_per_round: Mapped[list[int]] = mapped_column(JSON, nullable=False, default=lambda: [2, 4], server_default="[2,4]")
+    picks_per_round: Mapped[list[int]] = mapped_column(JSON, nullable=False, default=lambda: [2, 2], server_default="[2,2]")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")
     seeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

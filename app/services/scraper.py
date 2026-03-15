@@ -818,9 +818,7 @@ def _fetch_golfer_earnings(
                     try:
                         val = int(float(raw))
                         if val > 0:
-                            # Team events: officialAmount is the team's combined prize;
-                            # each golfer earns half.
-                            return val // 2 if is_team_event else val
+                            return val
                     except (ValueError, TypeError):
                         pass
     return None

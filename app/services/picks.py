@@ -12,9 +12,10 @@ Rules enforced:
   2. Deadline: tournament.start_date must be in the future for SCHEDULED picks.
   3. Pick-change lock: if IN_PROGRESS, the new golfer's tee_time must not
      have passed. If tee_time is null when IN_PROGRESS, pick is locked.
-     Exception: if the current pick's golfer has withdrawn (status "WD") AND
-     has no Round 1 TournamentEntryRound data (they withdrew before teeing off),
-     the change is allowed as long as the new golfer hasn't teed off.
+     Exception: if the current pick's golfer has no Round 1 TournamentEntryRound
+     data (they never teed off), the change is allowed as long as the new golfer
+     hasn't teed off. WD status is not required — ESPN sometimes omits it for
+     pre-event scratches replaced in the field before the tournament starts.
   4. Golfer must be entered in the tournament (TournamentEntry must exist).
   5. No-repeat rule: golfer not already picked this season in this league.
   6. One pick per tournament per user per season per league.
@@ -80,17 +81,16 @@ def validate_new_pick(
     if tournament.status == TournamentStatus.COMPLETED.value:
         raise HTTPException(status_code=400, detail="Tournament is already completed")
 
-    # Picks for a scheduled (upcoming) tournament are only allowed once every
-    # in-progress tournament in the league's schedule has completed. This prevents
-    # members from picking ahead while the current week's tournament is still live.
+    # Picks for a scheduled (upcoming) tournament are only allowed once the global
+    # PGA Tour schedule is clear: no tournament anywhere is in progress, and the
+    # most recently completed tournament's earnings have been published by ESPN.
+    # A league may skip PGA events; the real-world constraint (standings must be
+    # settled) applies globally regardless of the league's own schedule.
     if tournament.status == TournamentStatus.SCHEDULED.value:
+        # Block while any PGA tournament globally is still in progress.
         active = (
             db.query(Tournament)
-            .join(LeagueTournament, LeagueTournament.tournament_id == Tournament.id)
-            .filter(
-                LeagueTournament.league_id == league_id,
-                Tournament.status == TournamentStatus.IN_PROGRESS.value,
-            )
+            .filter(Tournament.status == TournamentStatus.IN_PROGRESS.value)
             .first()
         )
         if active:
@@ -99,38 +99,49 @@ def validate_new_pick(
                 detail=f"Picks for this tournament are not available until '{active.name}' completes",
             )
 
-        # Block if the most recently completed tournament's earnings haven't been
+        # Block if the pick target is not the globally-next scheduled PGA tournament.
+        # Members cannot pick ahead — the league's pick target must align with what
+        # would naturally be next on the PGA Tour schedule.
+        globally_next = (
+            db.query(Tournament)
+            .filter(Tournament.status == TournamentStatus.SCHEDULED.value)
+            .order_by(Tournament.start_date.asc())
+            .first()
+        )
+        if globally_next and tournament.id != globally_next.id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Picks are not yet available. '{globally_next.name}' has not been "
+                    "played yet — picks open once the global PGA schedule catches up."
+                ),
+            )
+
+        # Block if the globally last-completed tournament's earnings haven't been
         # published by ESPN yet.  score_picks() caches earnings in
-        # TournamentEntry.earnings_usd; a null value means ESPN hasn't released
-        # official prize money yet and the standings would be incorrect.
+        # TournamentEntry.earnings_usd; if the field is synced but no earnings exist,
+        # official prize money hasn't been released and standings would be incorrect.
         last_completed = (
             db.query(Tournament)
-            .join(LeagueTournament, LeagueTournament.tournament_id == Tournament.id)
-            .filter(
-                LeagueTournament.league_id == league_id,
-                Tournament.status == TournamentStatus.COMPLETED.value,
-            )
+            .filter(Tournament.status == TournamentStatus.COMPLETED.value)
             .order_by(Tournament.start_date.desc())
             .first()
         )
         if last_completed:
-            pick_golfer_ids_sq = (
-                db.query(Pick.golfer_id)
-                .filter(
-                    Pick.league_id == league_id,
-                    Pick.tournament_id == last_completed.id,
-                )
+            entries_exist = (
+                db.query(TournamentEntry)
+                .filter(TournamentEntry.tournament_id == last_completed.id)
+                .first()
             )
-            unfinalized = (
+            any_earnings = (
                 db.query(TournamentEntry)
                 .filter(
                     TournamentEntry.tournament_id == last_completed.id,
-                    TournamentEntry.golfer_id.in_(pick_golfer_ids_sq),
-                    TournamentEntry.earnings_usd.is_(None),
+                    TournamentEntry.earnings_usd.isnot(None),
                 )
                 .first()
             )
-            if unfinalized:
+            if entries_exist and not any_earnings:
                 raise HTTPException(
                     status_code=400,
                     detail=(

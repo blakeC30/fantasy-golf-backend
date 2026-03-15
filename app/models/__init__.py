@@ -13,6 +13,7 @@ from app.models.tournament import Tournament, TournamentEntry, TournamentEntryRo
 from app.models.pick import Pick
 from app.models.league_tournament import LeagueTournament
 from app.models.password_reset_token import PasswordResetToken
+from app.models.pick_reminder import PickReminder
 from app.models.playoff import PlayoffConfig, PlayoffRound, PlayoffPod, PlayoffPodMember, PlayoffPick, PlayoffDraftPreference
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "TournamentStatus",
     "Pick",
     "LeagueTournament",
+    "PickReminder",
     "PlayoffConfig",
     "PlayoffRound",
     "PlayoffPod",

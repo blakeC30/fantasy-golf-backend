@@ -1,0 +1,107 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: fantasygolf
+      POSTGRES_PASSWORD: fantasygolf
+      POSTGRES_DB: fantasygolf_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fantasygolf"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs,ses
+      - AWS_DEFAULT_REGION=us-east-1
+      - LOCALSTACK_HOST=localstack
+    volumes:
+      - ./localstack-init:/etc/localstack/init/ready.d
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./.env
+    environment:
+      # Override localhost (for native dev) with the Docker service name.
+      DATABASE_URL: postgresql://fantasygolf:fantasygolf@postgres:5432/fantasygolf_dev
+      # Point SES at LocalStack instead of real AWS.
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SES_FROM_EMAIL: noreply@league-caddie.com
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgresql://fantasygolf:fantasygolf@postgres:5432/fantasygolf_dev
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/fantasy-golf-events-dev
+    command: ["python", "-m", "app.scraper_main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: postgresql://fantasygolf:fantasygolf@postgres:5432/fantasygolf_dev
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/fantasy-golf-events-dev
+    command: ["python", "-m", "app.worker_main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

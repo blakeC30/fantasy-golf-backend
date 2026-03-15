@@ -205,7 +205,22 @@ def get_leaderboard(
             display_position[entry.id] = running_rank
             active_count += 1
 
-    stp_counts: Counter = Counter(v for v in stp_per_entry.values() if v is not None)
+    # Build separate stp counts for finishers vs. missed-cut players so that a
+    # CUT/MDF/WD/DQ player at the same total STP as a finisher cannot create a
+    # false tie (e.g. a CUT player at +10 should not mark the last finisher T73).
+    finisher_stp_counts: Counter = Counter(
+        stp_per_entry[e.id]
+        for e in entries
+        if e.status not in _BOTTOM_STATUSES and stp_per_entry[e.id] is not None
+    )
+    bottom_stp_counts: Counter = Counter(
+        stp_per_entry[e.id]
+        for e in entries
+        if e.status in _BOTTOM_STATUSES and stp_per_entry[e.id] is not None
+    )
+
+    def _stp_counts_for(entry) -> Counter:
+        return bottom_stp_counts if entry.status in _BOTTOM_STATUSES else finisher_stp_counts
 
     # Break ties resolved by a playoff.
     # Tied groups (same regulation stp) that include at least one entry with a
@@ -218,7 +233,7 @@ def get_leaderboard(
         if e.status in _BOTTOM_STATUSES:
             continue
         stp = stp_per_entry[e.id]
-        if stp is not None and stp_counts.get(stp, 0) > 1:
+        if stp is not None and finisher_stp_counts.get(stp, 0) > 1:
             tied_groups.setdefault(stp, []).append(e)
 
     for stp, group in tied_groups.items():
@@ -257,7 +272,7 @@ def get_leaderboard(
         rounds_sorted = sorted(entry.rounds, key=lambda r: r.round_number)
         total_stp = stp_per_entry[entry.id]
         is_tied = (
-            stp_counts.get(total_stp, 0) > 1 and entry.id not in playoff_tie_broken
+            _stp_counts_for(entry).get(total_stp, 0) > 1 and entry.id not in playoff_tie_broken
         ) if total_stp is not None else False
         # made_cut: true only for active/finished players (no special status).
         # This drives the single "Cut Line" divider in the UI — everyone with

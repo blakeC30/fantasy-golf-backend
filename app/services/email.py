@@ -147,3 +147,165 @@ def send_password_reset_email(to_email: str, raw_token: str) -> None:
             },
         },
     )
+
+
+def send_pick_reminder_email(
+    to_email: str,
+    display_name: str,
+    league_name: str,
+    league_id: str,
+    tournament_name: str,
+    start_date: str,
+    pick_window_open: bool,
+) -> None:
+    """
+    Send a weekly pick reminder to a league member who hasn't picked yet.
+
+    pick_window_open controls the email CTA:
+      True  → "Submit your pick" button linking to the pick page.
+      False → "Picks open soon" message (no button) for when a prior
+              tournament is still in_progress and the window hasn't opened.
+
+    Always logged at INFO level so it's visible in local dev (LocalStack
+    doesn't deliver email, but the log confirms the send was attempted).
+    """
+    pick_url = f"{settings.FRONTEND_URL}/leagues/{league_id}/pick"
+    log.info(
+        "Pick reminder for %s — league='%s' tournament='%s' window_open=%s url=%s",
+        to_email,
+        league_name,
+        tournament_name,
+        pick_window_open,
+        pick_url,
+    )
+
+    if pick_window_open:
+        cta_text = (
+            f"Head to League Caddie and submit your pick before {tournament_name} starts "
+            f"on {start_date}."
+        )
+        cta_plain = f"\nSubmit your pick: {pick_url}\n"
+    else:
+        cta_text = (
+            f"The pick window for {tournament_name} isn't open yet — it opens once the "
+            "current tournament finishes and earnings are posted. We'll send another "
+            "reminder when picks are available."
+        )
+        cta_plain = ""
+
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"You haven't submitted your pick for {tournament_name} ({start_date}) "
+        f"in {league_name} yet.\n\n"
+        f"{cta_text}{cta_plain}\n"
+        "If you've already picked or don't want these reminders, update your "
+        f"preferences at {settings.FRONTEND_URL}/settings.\n"
+    )
+
+    if pick_window_open:
+        cta_html = f"""
+              <!-- CTA button -->
+              <table cellpadding="0" cellspacing="0" style="margin:0 auto 28px;">
+                <tr>
+                  <td style="background-color:#166534;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.12);">
+                    <a href="{pick_url}"
+                       style="display:inline-block;padding:14px 32px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:12px;">
+                      Submit your pick →
+                    </a>
+                  </td>
+                </tr>
+              </table>"""
+    else:
+        cta_html = """
+              <div style="background-color:#fefce8;border:1px solid #fde68a;border-radius:10px;padding:16px 20px;margin-bottom:28px;">
+                <p style="margin:0;font-size:14px;color:#92400e;line-height:1.5;">
+                  <strong>Picks not open yet.</strong> The pick window opens once the current
+                  tournament finishes and earnings are posted.
+                </p>
+              </div>"""
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pick reminder — {tournament_name}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f3f4f6;padding:40px 16px;">
+    <tr>
+      <td align="center">
+        <table width="100%" style="max-width:520px;background-color:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+
+          <!-- Header — matches app gradient -->
+          <tr>
+            <td style="background:linear-gradient(to bottom right,#052e16,#14532d,#166534);padding:36px 40px;text-align:center;">
+              <table cellpadding="0" cellspacing="0" style="margin:0 auto;">
+                <tr>
+                  <td style="padding-right:8px;vertical-align:middle;">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg">
+                      <path fill-rule="evenodd" clip-rule="evenodd" d="M3 2.25a.75.75 0 0 1 .75.75v.54l1.838-.46a9.75 9.75 0 0 1 6.725.738l.108.054A8.25 8.25 0 0 0 18 4.524l3.11-.732a.75.75 0 0 1 .917.81 47.784 47.784 0 0 0 .005 10.337.75.75 0 0 1-.574.812l-3.114.733a9.75 9.75 0 0 1-6.594-.77l-.108-.054a8.25 8.25 0 0 0-5.69-.625l-2.202.55V21a.75.75 0 0 1-1.5 0V3A.75.75 0 0 1 3 2.25Z" />
+                    </svg>
+                  </td>
+                  <td style="vertical-align:middle;">
+                    <span style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.3px;">League Caddie</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:40px 40px 32px;">
+              <p style="margin:0 0 8px;font-size:11px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;color:#15803d;">Pick Reminder</p>
+              <h1 style="margin:0 0 16px;font-size:26px;font-weight:700;color:#111827;line-height:1.25;">Don't forget to pick!</h1>
+              <p style="margin:0 0 8px;font-size:15px;color:#6b7280;line-height:1.6;">
+                Hi <strong style="color:#111827;">{display_name}</strong>,
+              </p>
+              <p style="margin:0 0 24px;font-size:15px;color:#6b7280;line-height:1.6;">
+                You haven't submitted your pick for
+                <strong style="color:#111827;">{tournament_name}</strong>
+                (starts <strong style="color:#111827;">{start_date}</strong>)
+                in <strong style="color:#111827;">{league_name}</strong> yet.
+              </p>
+{cta_html}
+
+              <!-- Divider -->
+              <hr style="border:none;border-top:1px solid #e5e7eb;margin:0 0 24px;" />
+
+              <p style="margin:0;font-size:13px;color:#9ca3af;line-height:1.5;">
+                To stop receiving pick reminders, visit
+                <a href="{settings.FRONTEND_URL}/settings" style="color:#166534;text-decoration:none;">Settings</a>
+                and turn off email notifications.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color:#f9fafb;border-top:1px solid #e5e7eb;padding:20px 40px;text-align:center;">
+              <p style="margin:0;font-size:12px;color:#9ca3af;">
+                &copy; 2026 League Caddie &nbsp;&middot;&nbsp; {league_name}
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+    _ses_client().send_email(
+        Source=settings.SES_FROM_EMAIL,
+        Destination={"ToAddresses": [to_email]},
+        Message={
+            "Subject": {"Data": f"Pick reminder: {tournament_name} starts {start_date}"},
+            "Body": {
+                "Text": {"Data": text_body},
+                "Html": {"Data": html_body},
+            },
+        },
+    )

@@ -21,6 +21,7 @@ from app.models.base import Base
 if TYPE_CHECKING:
     from app.models.league import League
     from app.models.pick import Pick
+    from app.models.pick_reminder import PickReminder
 
 
 class Season(Base):
@@ -59,6 +60,9 @@ class Season(Base):
     # --- Relationships ---
     league: Mapped["League"] = relationship(back_populates="seasons")
     picks: Mapped[list["Pick"]] = relationship(back_populates="season")
+    pick_reminders: Mapped[list["PickReminder"]] = relationship(
+        back_populates="season", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<Season league={self.league_id} year={self.year} active={self.is_active}>"

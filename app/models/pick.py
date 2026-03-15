@@ -147,15 +147,14 @@ class Pick(Base):
                 return True  # safety: no entry data = locked
             # Determine whether the golfer actually started their round.
             # TournamentEntryRound rows are only created once a golfer tees off and
-            # the scraper processes their linescore data. A WD with no R1 round data
-            # means a pre-tee-time scratch (late withdrawal), so the pick is unlocked.
+            # the scraper processes their linescore data. If no R1 round data exists,
+            # the golfer never played — unlock regardless of WD status, since ESPN
+            # sometimes omits the WD status for pre-event scratches (e.g. a golfer
+            # who withdraws before their tee time due to illness and is replaced in
+            # the field may never appear on the in-tournament leaderboard at all).
             r1_played = any(r.round_number == 1 for r in self.entry.rounds)
-            if (
-                self.entry.status is not None
-                and "wd" in self.entry.status.lower()
-                and not r1_played
-            ):
-                return False  # withdrew before teeing off — member may swap
+            if not r1_played:
+                return False  # never teed off — member may swap
             if self.entry.tee_time is None:
                 return True  # belt-and-suspenders: no tee_time when in_progress = locked
             return self.entry.tee_time <= datetime.now(timezone.utc)
