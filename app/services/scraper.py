@@ -1499,7 +1499,14 @@ def sync_tournament(db: Session, pga_tour_id: str, *, force: bool = False) -> di
         db.commit()
         log.info("Force sync: cleared %d entries' round data for '%s'", len(entries), tournament.name)
 
-    # Fetch purse from the core event endpoint (site API scoreboard doesn't include it).
+    # Fetch purse and tournament status from the core event endpoint.
+    # The site API scoreboard (used by sync_schedule) is the canonical status source,
+    # but this endpoint also returns status — reading it here lets sync_tournament()
+    # detect and apply the in_progress → completed transition without waiting for
+    # the next daily schedule sync (which runs at 06:00 UTC).
+    # Status update is outside the try/except so a purse fetch failure does not
+    # silently block completion detection.
+    event_data: dict = {}
     try:
         event_data = _get_json(f"{_CORE_API_BASE}/events/{pga_tour_id}")
         raw_purse = event_data.get("purse")
@@ -1507,7 +1514,23 @@ def sync_tournament(db: Session, pga_tour_id: str, *, force: bool = False) -> di
             tournament.purse_usd = int(raw_purse)
             db.commit()
     except Exception as exc:
-        log.warning("Could not fetch purse for %s: %s", pga_tour_id, exc)
+        log.warning("Could not fetch event data for %s: %s", pga_tour_id, exc)
+
+    # Apply status transition if ESPN reports a different status than what's in the DB.
+    # _publish_schedule_transitions fires TOURNAMENT_COMPLETED via SQS so the worker
+    # can run score_picks() — same path as the daily sync_schedule() transition.
+    raw_espn_status = event_data.get("status", {}).get("type", {}).get("name")
+    if raw_espn_status:
+        new_status = _map_espn_status(raw_espn_status)
+        if tournament.status != new_status:
+            old_status = tournament.status
+            tournament.status = new_status
+            db.commit()
+            log.info(
+                "sync_tournament: status transition for '%s': %s → %s",
+                tournament.name, old_status, new_status,
+            )
+            _publish_schedule_transitions([(str(tournament.id), old_status, new_status)])
 
     # Pass IDs of golfers already in DB so fetch functions skip re-fetching them.
     known_ids = {g.pga_tour_id for g in db.query(Golfer).all()}

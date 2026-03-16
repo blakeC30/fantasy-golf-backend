@@ -112,3 +112,15 @@ app.include_router(playoff.router, prefix=_PREFIX)
 def health():
     """Simple health check endpoint used by Kubernetes liveness probes."""
     return {"status": "ok"}
+
+
+@app.get("/api/v1/config")
+def public_config():
+    """Public feature-flag endpoint consumed by the frontend on load.
+
+    Returns platform-level flags that affect UI availability without
+    requiring the user to be authenticated.
+    """
+    return {
+        "league_creation_restricted": settings.LEAGUE_CREATION_RESTRICTED,
+    }

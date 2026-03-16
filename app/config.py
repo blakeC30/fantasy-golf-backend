@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # --- App ---
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
+    # When True, only platform admins can create leagues. All other users see a
+    # "not available yet" message. Flip to False once the platform opens publicly.
+    LEAGUE_CREATION_RESTRICTED: bool = False
 
     # --- CORS ---
     # The frontend origin that is allowed to make cross-origin requests to the API.

@@ -34,6 +34,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session, joinedload
 
 from app.limiter import limiter
+from app.config import settings
 
 from app.database import get_db
 from app.dependencies import get_current_user, get_league_or_404, require_league_manager, require_league_member
@@ -80,6 +81,13 @@ def create_league(
     An active season for the current calendar year is created. All leagues are
     private by default — joining requires an invite link and manager approval.
     """
+    # Guard: league creation may be restricted to platform admins only.
+    if settings.LEAGUE_CREATION_RESTRICTED and not current_user.is_platform_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="League creation is not available yet. Stay tuned!",
+        )
+
     # Guard: per-user league cap — checked before any DB write so nothing is rolled back.
     user_league_count = db.query(LeagueMember).filter_by(
         user_id=current_user.id,
